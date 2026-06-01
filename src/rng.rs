@@ -17,6 +17,20 @@ pub fn brownian_displacement<R: Rng + ?Sized>(d: f64, dt: f64, rng: &mut R) -> V
     Vec3::new(normal.sample(rng), normal.sample(rng), normal.sample(rng))
 }
 
+/// A uniformly-distributed unit vector on the sphere (three standard normals,
+/// normalised). Used to orient the tauRAMD random-acceleration force.
+#[must_use]
+pub fn random_unit<R: Rng + ?Sized>(rng: &mut R) -> Vec3 {
+    let n = Normal::new(0.0, 1.0).expect("unit normal");
+    loop {
+        let v = Vec3::new(n.sample(rng), n.sample(rng), n.sample(rng));
+        let len2 = v.norm2();
+        if len2 > 1e-12 {
+            return v.scale(1.0 / len2.sqrt());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +60,18 @@ mod tests {
             (var - expected).abs() / expected < 0.02,
             "variance should be ~{expected}, got {var}"
         );
+    }
+
+    #[test]
+    fn random_unit_is_unit_length() {
+        let mut rng = StdRng::seed_from_u64(3);
+        for _ in 0..1000 {
+            let v = random_unit(&mut rng);
+            assert!(
+                (v.norm2() - 1.0).abs() < 1e-12,
+                "not unit length: {}",
+                v.norm2()
+            );
+        }
     }
 }

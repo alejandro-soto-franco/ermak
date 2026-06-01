@@ -8,6 +8,7 @@ pub mod error;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod integrator;
+pub mod kinetics;
 pub mod memory;
 pub mod potential;
 pub mod rng;
