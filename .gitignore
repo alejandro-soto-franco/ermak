@@ -3,3 +3,11 @@ Cargo.lock
 *.csv
 *.pdf
 __pycache__/
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target
+/crowding.png
