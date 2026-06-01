@@ -7,12 +7,9 @@
 //! v1 holds the crowders fixed (a quenched obstacle matrix); mobile crowders
 //! are a documented extension.
 
-use crate::potential::wca_pair_force;
-use crate::rng::brownian_displacement;
+use crate::backend::{CpuBackend, Scenario, ensemble_deff};
+use crate::memory::MemoryBudget;
 use crate::vec3::Vec3;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rayon::prelude::*;
 
 /// Crowder centres on a simple-cubic lattice of `n` per side in a box of side
 /// `box_l`, offset to the cell centres so the lattice corners are interstitial
@@ -43,18 +40,13 @@ pub fn volume_fraction(n_crowders: usize, sigma: f64, box_l: f64) -> f64 {
     n_crowders as f64 * sphere / box_l.powi(3)
 }
 
-/// Minimum-image displacement of `d` under a cubic box of side `l`.
-fn min_image(d: Vec3, l: f64) -> Vec3 {
-    Vec3::new(
-        d.x - l * (d.x / l).round(),
-        d.y - l * (d.y / l).round(),
-        d.z - l * (d.z / l).round(),
-    )
-}
-
 /// Effective diffusion coefficient of a tracer (bare coefficient `d0`) among
 /// fixed `crowders` in a periodic box of side `box_l`, from the ensemble MSD.
 /// Reduced units (`kB T = 1`, so mobility = `d0`).
+///
+/// Runs through the budgeted, batched CPU backend, so the ensemble is streamed
+/// within the `ERMAK_MAX_BYTES` budget (default 256 MiB) and cannot over-commit
+/// host memory regardless of `replicas`.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn crowded_diffusion_deff(
@@ -68,32 +60,18 @@ pub fn crowded_diffusion_deff(
     sigma: f64,
     eps: f64,
 ) -> f64 {
-    use crate::integrator::em_step;
-
-    let total_msd: f64 = (0..replicas)
-        .into_par_iter()
-        .map(|replica| {
-            let mut rng =
-                StdRng::seed_from_u64(seed ^ (replica as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            // Start at a lattice corner (interstitial void), unwrapped position.
-            let mut r = Vec3::ZERO;
-            for _ in 0..steps {
-                // Excluded-volume force from every crowder under the minimum image.
-                let mut force = Vec3::ZERO;
-                for &c in crowders {
-                    let d = min_image(r - c, box_l);
-                    force += wca_pair_force(d, sigma, eps);
-                }
-                let noise = brownian_displacement(d0, dt, &mut rng);
-                // Reduced units: mobility = d0 / (kB T) = d0.
-                r = em_step(r, force, d0, dt, noise);
-            }
-            r.norm2()
-        })
-        .sum();
-    let msd = total_msd / replicas as f64;
-    let t = steps as f64 * dt;
-    msd / (6.0 * t)
+    let scenario = Scenario {
+        d0,
+        dt,
+        steps,
+        box_l,
+        sigma,
+        eps,
+        crowders: crowders.to_vec(),
+    };
+    let budget = MemoryBudget::from_env_or(256 * 1024 * 1024, "host ensemble");
+    ensemble_deff(&scenario, replicas, seed, &CpuBackend, &budget)
+        .expect("a streamed ensemble fits the default 256 MiB budget")
 }
 
 #[cfg(test)]

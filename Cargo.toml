@@ -8,6 +8,11 @@ repository = "https://github.com/alejandro-soto-franco/ermak"
 keywords = ["brownian-dynamics", "molecular-dynamics", "biophysics", "simulation", "diffusion"]
 categories = ["science", "simulation"]
 
+[features]
+# GPU acceleration. Off by default so the crate builds and runs (CPU reference)
+# on any machine and in CI without a GPU toolchain.
+gpu = []
+
 [dependencies]
 rand = "0.8"
 rand_distr = "0.4"
