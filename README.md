@@ -48,14 +48,14 @@ cargo test
 ## Dissociation kinetics and tauRAMD
 
 A ligand sits in a buried pocket and must cross a bottleneck barrier to escape,
-the coarse-grained setting of Nunes-Alves's work on ligand escape from
-T4 lysozyme and inhibitor dissociation through NiFe-hydrogenase bottlenecks.
-Raising the barrier is a proxy for a slower-dissociating ligand series. Plain
-Brownian dynamics gives the true residence time (`1/k_off`), which climbs with
-the barrier as Kramers predicts; **tauRAMD** (her signature method) adds a
-reoriented random-acceleration force that drives escape fast, and its egress
-times *rank* the true residence times, the property that makes it a practical
-predictor of relative `k_off`.
+the coarse-grained setting of ligand unbinding from buried sites such as
+T4 lysozyme and inhibitor dissociation through enzyme bottlenecks. Raising the
+barrier is a proxy for a slower-dissociating ligand series. Plain Brownian
+dynamics gives the true residence time (`1/k_off`), which climbs with the
+barrier as Kramers predicts; **tauRAMD** (Kokh et al. 2018) adds a reoriented
+random-acceleration force that drives escape fast, and its egress times *rank*
+the true residence times, the property that makes it a practical predictor of
+relative `k_off`.
 
 ![Residence time vs barrier](docs/escape_residence.png)
 
