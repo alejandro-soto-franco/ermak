@@ -109,8 +109,6 @@ scripts/run-bounded.sh cargo test --features gpu -- --ignored gpu_
 
 ## Roadmap
 
-(see the `ermak-planning` repo for the design spec):
-
 1. **CPU engine + validation** (done): crowded-environment diffusion,
    analytical-limit tests.
 2. **GPU backend + memory guardrails** (done): a feature-gated CUDA-driver-API
