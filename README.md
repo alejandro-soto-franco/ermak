@@ -57,19 +57,45 @@ embarrassingly parallel (`rayon`) and reproducible for a fixed seed.
 
 Reduced Lennard-Jones units throughout (`kB T = 1`, `sigma = 1`, bare `D_0 = 1`).
 
+## GPU backend (feature `gpu`)
+
+The same ensemble runs on the GPU through the CUDA driver API (cudarc): one
+walker per thread runs the full trajectory (crowder forces under the minimum
+image, drift, and a xoshiro256++ Box-Muller Gaussian kick). The CPU backend
+stays the correctness reference; the GPU reproduces its `D_eff` within a
+statistical tolerance, validated for both free diffusion and crowding.
+
+Memory is guardrailed at three levels, because this machine has been OOM-killed
+before and the GPU has only ~8 GiB of VRAM:
+
+- **in-process budget**: a request over the cap returns an error instead of
+  allocating (`ERMAK_MAX_BYTES`); the ensemble streams in bounded batches, so
+  peak footprint is set by the batch size, not the walker count;
+- **device budget**: a GPU batch is sized to a fraction of *free* VRAM (queried
+  from `nvidia-smi`), so it can never claim the whole device;
+- **OS backstop**: `scripts/run-bounded.sh` runs any build or simulation in a
+  systemd memory scope (`MemoryMax`/`MemorySwapMax`) that SIGKILLs a runaway
+  before it can take down the machine.
+
+```
+# build + validate the GPU backend, hard-capped at 12 GiB
+scripts/run-bounded.sh cargo test --features gpu -- --ignored gpu_
+```
+
 ## Roadmap
 
-This is phase one of three (see the `ermak-planning` repo for the design spec):
+Phases one and two are done (see the `ermak-planning` repo for the design spec):
 
-1. **CPU engine + validation** (this release): crowded-environment diffusion,
+1. **CPU engine + validation** (done): crowded-environment diffusion,
    analytical-limit tests.
-2. **GPU backend**: a feature-gated `cuda-oxide` ensemble propagator (one walker
-   per thread); the CPU backend stays the correctness reference.
-3. **Binding kinetics + ML**: association rate (Smoluchowski limit), residence
-   time / dissociation rate (Kramers limit) with a tauRAMD-style egress
-   protocol, and an ML layer predicting `k_off` from system descriptors.
+2. **GPU backend + memory guardrails** (done): a feature-gated CUDA-driver-API
+   propagator (one walker per thread) that reproduces the CPU reference, plus
+   the in-process / device / OS memory guardrails above.
+3. **Binding kinetics + ML** (next): association rate (Smoluchowski limit),
+   residence time / dissociation rate (Kramers limit) with a tauRAMD-style
+   egress protocol, and an ML layer predicting `k_off` from system descriptors.
 
-Phase one holds the crowders fixed (a quenched obstacle matrix) and uses
+Phases one and two hold the crowders fixed (a quenched obstacle matrix) and use
 free-draining, isotropic diffusion; mobile crowders and hydrodynamic
 interactions (Rotne-Prager-Yamakawa) are the planned extensions.
 

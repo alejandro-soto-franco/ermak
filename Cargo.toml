@@ -11,9 +11,18 @@ categories = ["science", "simulation"]
 [features]
 # GPU acceleration. Off by default so the crate builds and runs (CPU reference)
 # on any machine and in CI without a GPU toolchain.
-gpu = []
+gpu = ["dep:cudarc"]
 
 [dependencies]
 rand = "0.8"
 rand_distr = "0.4"
 rayon = "1.12.0"
+# CUDA driver API via cudarc (the maintained successor to cust). `dynamic-loading`
+# dlopens libcuda/libnvrtc at runtime: no CUDA headers or linking at build time,
+# so the build stays light and version-flexible (CUDA 13 here).
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-13010",
+] }
