@@ -10,6 +10,7 @@ pub mod gpu;
 pub mod integrator;
 pub mod kinetics;
 pub mod memory;
+pub mod ml;
 pub mod potential;
 pub mod rng;
 pub mod vec3;
