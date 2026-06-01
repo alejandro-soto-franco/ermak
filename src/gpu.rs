@@ -162,6 +162,60 @@ __global__ void bd_walk(
     out_msd[w] = rx * rx + ry * ry + rz * rz;
 }
 
+// Single-precision variant: identical dynamics in float. Consumer GPUs run f32
+// at up to 64x the f64 rate, so this is the throughput path; the f64 kernel
+// above is the precision/reference path.
+__device__ __forceinline__ float u01f(unsigned long long *s) {
+    return ((float)(xnext(s) >> 40) + 0.5f) * (1.0f / 16777216.0f); // 24-bit
+}
+
+__global__ void bd_walk_f32(
+    float *out_msd, const float *crowders, int n_crowders, int n_walkers,
+    int steps, float d0, float dt, float box_l, float sigma, float eps,
+    unsigned long long seed, unsigned int walker_offset)
+{
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= n_walkers) return;
+    unsigned long long ss =
+        seed ^ ((unsigned long long)(walker_offset + (unsigned int)w) * 0x9E3779B97F4A7C15ULL);
+    unsigned long long s[4];
+    s[0] = sm64(&ss); s[1] = sm64(&ss); s[2] = sm64(&ss); s[3] = sm64(&ss);
+
+    float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+    float rc = sigma * 1.1224620f, rc2 = rc * rc, sigma2 = sigma * sigma;
+    float sdev = sqrtf(2.0f * d0 * dt);
+    const float TWO_PI = 6.2831853f;
+
+    for (int step = 0; step < steps; step++) {
+        float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+        for (int c = 0; c < n_crowders; c++) {
+            float dx = rx - crowders[3 * c + 0];
+            float dy = ry - crowders[3 * c + 1];
+            float dz = rz - crowders[3 * c + 2];
+            dx -= box_l * rintf(dx / box_l);
+            dy -= box_l * rintf(dy / box_l);
+            dz -= box_l * rintf(dz / box_l);
+            float r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 < rc2 && r2 > 0.0f) {
+                float sr2 = sigma2 / r2;
+                float sr6 = sr2 * sr2 * sr2;
+                float coeff = 24.0f * eps * (2.0f * sr6 * sr6 - sr6) / r2;
+                fx += coeff * dx; fy += coeff * dy; fz += coeff * dz;
+            }
+        }
+        float u1 = u01f(s), u2 = u01f(s);
+        float rr = sqrtf(-2.0f * logf(u1));
+        float n0 = sdev * rr * cosf(TWO_PI * u2);
+        float n1 = sdev * rr * sinf(TWO_PI * u2);
+        float u3 = u01f(s), u4 = u01f(s);
+        float n2 = sdev * sqrtf(-2.0f * logf(u3)) * cosf(TWO_PI * u4);
+        rx += d0 * fx * dt + n0;
+        ry += d0 * fy * dt + n1;
+        rz += d0 * fz * dt + n2;
+    }
+    out_msd[w] = rx * rx + ry * ry + rz * rz;
+}
+
 } // extern "C"
 "#;
 
@@ -170,6 +224,7 @@ pub struct GpuBackend {
     _ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     func: CudaFunction,
+    func_f32: CudaFunction,
 }
 
 impl GpuBackend {
@@ -185,11 +240,82 @@ impl GpuBackend {
             .map_err(|e| ErmakError::Gpu(format!("nvrtc compile: {e:?}")))?;
         let module = ctx.load_module(ptx).map_err(driver_err)?;
         let func = module.load_function("bd_walk").map_err(driver_err)?;
+        let func_f32 = module.load_function("bd_walk_f32").map_err(driver_err)?;
         Ok(Self {
             _ctx: ctx,
             stream,
             func,
+            func_f32,
         })
+    }
+
+    /// Single-precision throughput variant of [`EnsembleBackend::msd_sum`]: same
+    /// dynamics, `f32` on the device. Faster on consumer GPUs (f64 is rate-
+    /// limited there) at the cost of precision, so it matches the CPU reference
+    /// only to a looser statistical tolerance.
+    ///
+    /// # Errors
+    /// Budget and driver errors, as [`EnsembleBackend::msd_sum`].
+    pub fn msd_sum_f32(
+        &self,
+        scenario: &Scenario,
+        n_walkers: usize,
+        seed: u64,
+        budget: &MemoryBudget,
+    ) -> Result<f64, ErmakError> {
+        budget.ensure_fits(WALKER_BYTES)?;
+        let batch = budget.max_items(WALKER_BYTES).max(1);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let flat: Vec<f32> = scenario
+            .crowders
+            .iter()
+            .flat_map(|c| [c.x as f32, c.y as f32, c.z as f32])
+            .collect();
+        let host_crowders = if flat.is_empty() { vec![0.0f32] } else { flat };
+        let d_crowders = self.stream.clone_htod(&host_crowders).map_err(driver_err)?;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let n_cr = scenario.crowders.len() as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let steps_i = scenario.steps as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let (d0, dt, box_l, sigma, eps) = (
+            scenario.d0 as f32,
+            scenario.dt as f32,
+            scenario.box_l as f32,
+            scenario.sigma as f32,
+            scenario.eps as f32,
+        );
+
+        let mut total = 0.0f64;
+        for (start, len) in batch_spans(n_walkers, batch) {
+            let mut d_out = self.stream.alloc_zeros::<f32>(len).map_err(driver_err)?;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let len_i = len as i32;
+            #[allow(clippy::cast_possible_truncation)]
+            let offset = start as u32;
+            let cfg = LaunchConfig::for_num_elems(len as u32);
+
+            let mut b = self.stream.launch_builder(&self.func_f32);
+            b.arg(&mut d_out);
+            b.arg(&d_crowders);
+            b.arg(&n_cr);
+            b.arg(&len_i);
+            b.arg(&steps_i);
+            b.arg(&d0);
+            b.arg(&dt);
+            b.arg(&box_l);
+            b.arg(&sigma);
+            b.arg(&eps);
+            b.arg(&seed);
+            b.arg(&offset);
+            unsafe { b.launch(cfg) }.map_err(driver_err)?;
+
+            let out = self.stream.clone_dtoh(&d_out).map_err(driver_err)?;
+            total += out.iter().map(|v| f64::from(*v)).sum::<f64>();
+        }
+        Ok(total)
     }
 }
 

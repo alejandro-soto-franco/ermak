@@ -123,9 +123,71 @@ pub fn tauramd_egress_time(
         / replicas as f64
 }
 
+/// Record one escape trajectory: positions sampled every `stride` steps from the
+/// pocket centre until the ligand crosses the bottleneck (or `max_steps`). Used
+/// to visualise the multiple egress pathways out of a buried pocket.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn escape_path(
+    barrier: f64,
+    r_b: f64,
+    d0: f64,
+    dt: f64,
+    accel: f64,
+    reorient_steps: usize,
+    max_steps: usize,
+    stride: usize,
+    seed: u64,
+) -> Vec<Vec3> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut r = Vec3::ZERO;
+    let rb2 = r_b * r_b;
+    let mut path = vec![r];
+    let mut dir = if accel > 0.0 {
+        random_unit(&mut rng)
+    } else {
+        Vec3::ZERO
+    };
+    for step in 0..max_steps {
+        if accel > 0.0 && reorient_steps > 0 && step % reorient_steps == 0 {
+            dir = random_unit(&mut rng);
+        }
+        let mut force = pocket_force(r, barrier, r_b);
+        if accel > 0.0 {
+            force += dir.scale(accel);
+        }
+        let noise = brownian_displacement(d0, dt, &mut rng);
+        r = em_step(r, force, d0, dt, noise);
+        if stride > 0 && step % stride == 0 {
+            path.push(r);
+        }
+        if r.norm2() >= rb2 {
+            path.push(r);
+            break;
+        }
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_path_starts_at_centre_and_reaches_the_bottleneck() {
+        let path = escape_path(2.0, 2.0, 1.0, 0.001, 6.0, 100, 200_000, 50, 5);
+        assert_eq!(
+            path[0],
+            Vec3::ZERO,
+            "trajectory starts at the pocket centre"
+        );
+        let last = *path.last().unwrap();
+        assert!(
+            last.norm2() >= 2.0 * 2.0 - 1e-6,
+            "an accelerated trajectory should reach the bottleneck, got r^2={}",
+            last.norm2()
+        );
+    }
 
     #[test]
     fn residence_time_increases_with_barrier() {

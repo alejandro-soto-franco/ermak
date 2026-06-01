@@ -52,6 +52,28 @@ impl Scenario {
         }
         r.norm2()
     }
+
+    /// One tracer trajectory (unwrapped positions, sampled every `stride`
+    /// steps), for visualising diffusion through the crowder matrix.
+    #[must_use]
+    pub fn path(&self, seed: u64, stride: usize) -> Vec<Vec3> {
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x5DEE_CE66_D5C3_1A11);
+        let mut r = Vec3::ZERO;
+        let mut path = vec![r];
+        for step in 0..self.steps {
+            let mut force = Vec3::ZERO;
+            for &c in &self.crowders {
+                let d = min_image(r - c, self.box_l);
+                force += wca_pair_force(d, self.sigma, self.eps);
+            }
+            let noise = brownian_displacement(self.d0, self.dt, &mut rng);
+            r = em_step(r, force, self.d0, self.dt, noise);
+            if stride > 0 && step % stride == 0 {
+                path.push(r);
+            }
+        }
+        path
+    }
 }
 
 /// Minimum-image displacement of `d` under a cubic box of side `l`.
