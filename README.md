@@ -57,7 +57,9 @@ reoriented random-acceleration force that drives escape fast, and its egress
 times *rank* the true residence times, the property that makes it a practical
 predictor of relative `k_off`.
 
-![Residence time and tauRAMD ranking](docs/escape.png)
+![Residence time vs barrier](docs/escape_residence.png)
+
+![tauRAMD ranks residence times](docs/escape_tauramd.png)
 
 ```
 cargo run --release --example ligand_escape > escape.csv

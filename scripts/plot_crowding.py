@@ -18,7 +18,7 @@ plt.rcParams.update(
         "text.usetex": True,
         "font.family": "serif",
         "axes.grid": False,
-        "font.size": 12,
+        "font.size": 16,
     }
 )
 
@@ -31,8 +31,8 @@ def main() -> None:
             phi.append(float(row["phi"]))
             ratio.append(float(row["d_eff_over_d0"]))
 
-    fig, ax = plt.subplots(figsize=(5.0, 3.6))
-    ax.plot(phi, ratio, "o-", color="#1a1a2e", markerfacecolor="#2563eb", lw=1.6)
+    fig, ax = plt.subplots(figsize=(7.6, 5.6))
+    ax.plot(phi, ratio, "o-", color="#1a1a2e", markerfacecolor="#2563eb", lw=2.0, markersize=11)
     ax.set_xlabel(r"crowder volume fraction $\phi$")
     ax.set_ylabel(r"$D_\mathrm{eff} / D_0$")
     ax.set_title(r"Crowders slow tracer diffusion")
