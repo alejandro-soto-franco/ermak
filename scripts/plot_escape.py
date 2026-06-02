@@ -44,7 +44,7 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(7.6, 5.6))
     ax.plot(residence, tau, "o-", color=INK, markerfacecolor="#e0467c", lw=2.0, markersize=12)
     ax.set_xlabel(r"true residence time $\tau_\mathrm{res}$ (plain BD)")
-    ax.set_ylabel(r"tauRAMD egress time")
+    ax.set_ylabel(r"$\tau$RAMD egress time")
     ax.set_title(r"tauRAMD egress times rank residence times")
     fig.tight_layout()
     fig.savefig(f"{stem}_tauramd.png", dpi=200)
