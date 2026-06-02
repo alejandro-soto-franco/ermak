@@ -90,8 +90,7 @@ image, drift, and a xoshiro256++ Box-Muller Gaussian kick). The CPU backend
 stays the correctness reference; the GPU reproduces its `D_eff` within a
 statistical tolerance, validated for both free diffusion and crowding.
 
-Memory is guardrailed at three levels, because this machine has been OOM-killed
-before and the GPU has only ~8 GiB of VRAM:
+Memory is guardrailed at three levels, since GPU VRAM is limited (often ~8 GiB):
 
 - **in-process budget**: a request over the cap returns an error instead of
   allocating (`ERMAK_MAX_BYTES`); the ensemble streams in bounded batches, so
@@ -100,7 +99,7 @@ before and the GPU has only ~8 GiB of VRAM:
   from `nvidia-smi`), so it can never claim the whole device;
 - **OS backstop**: `scripts/run-bounded.sh` runs any build or simulation in a
   systemd memory scope (`MemoryMax`/`MemorySwapMax`) that SIGKILLs a runaway
-  before it can take down the machine.
+  process before it can exhaust system memory.
 
 ```
 # build + validate the GPU backend, hard-capped at 12 GiB
