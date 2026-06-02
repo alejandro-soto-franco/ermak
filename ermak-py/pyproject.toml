@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ermak"
+description = "GPU-accelerated Brownian dynamics for ligand diffusion and dissociation kinetics in crowded environments"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Alejandro Soto Franco", email = "sotofranco.eng@gmail.com" }]
+keywords = ["brownian-dynamics", "molecular-dynamics", "biophysics", "diffusion", "kinetics"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/alejandro-soto-franco/ermak"
+
+[tool.maturin]
+module-name = "ermak"
+features = ["pyo3/extension-module"]

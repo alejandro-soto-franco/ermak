@@ -1,3 +1,6 @@
+[workspace]
+members = ["ermak-py"]
+
 [package]
 name = "ermak"
 version = "0.1.0"

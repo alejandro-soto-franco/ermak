@@ -1,0 +1,72 @@
+# PyPI publish workflow for the `ermak` Python package (ermak-py crate).
+#
+# Configured under the PyPI Trusted Publisher for project `ermak`:
+#   repository: alejandro-soto-franco/ermak
+#   workflow:   release.yml
+#   environment: pypi
+#
+# The wheel is pure Rust (the CUDA `gpu` feature is opt-in and NOT built here),
+# so wheels build directly on the GitHub runners with maturin: no CUDA toolchain,
+# no local build step. abi3-py39 means one wheel per platform covers Python 3.9+.
+#
+# Trigger: push a tag like `v0.1.0`, or run manually. Publishing uses OIDC
+# trusted publishing, so there is no PyPI token in repository secrets.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheels (${{ matrix.platform.os }} / ${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: linux,   runner: ubuntu-latest,  target: x86_64,  manylinux: auto }
+          - { os: linux,   runner: ubuntu-latest,  target: aarch64, manylinux: auto }
+          - { os: macos,   runner: macos-13,       target: x86_64,  manylinux: "" }
+          - { os: macos,   runner: macos-latest,   target: aarch64, manylinux: "" }
+          - { os: windows, runner: windows-latest, target: x64,     manylinux: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: --release --out dist --manifest-path ermak-py/Cargo.toml
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          path: dist
+
+  publish:
+    name: Publish to PyPI
+    needs: [wheels]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      id-token: write # required by PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

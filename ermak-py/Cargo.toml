@@ -1,0 +1,21 @@
+[package]
+name = "ermak-py"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Python bindings for ermak: GPU-accelerated Brownian dynamics for ligand diffusion and dissociation kinetics in crowded environments"
+repository = "https://github.com/alejandro-soto-franco/ermak"
+publish = false
+
+# The produced extension module is `ermak` (so `import ermak` works); the wheel
+# itself is named `ermak` on PyPI. Pure-Rust core, so the wheel never needs a
+# CUDA toolchain (the `gpu` feature is opt-in and not enabled here).
+[lib]
+name = "ermak"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Renamed to `ermak_core` in scope so it does not clash with this crate's own
+# `ermak` lib target (the produced extension module).
+ermak_core = { package = "ermak", path = ".." }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
