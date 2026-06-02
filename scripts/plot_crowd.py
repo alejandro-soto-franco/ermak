@@ -29,6 +29,23 @@ def main() -> None:
     crowders = np.array(crowders)
     tracer = np.array(tracer)
 
+    box_l = float(sys.argv[2]) if len(sys.argv) > 2 else 8.0
+    pad = float(sys.argv[3]) if len(sys.argv) > 3 else 0.8
+
+    # The system is periodic, so plot the tracer at its minimum-image position
+    # inside the (origin-centred) crowder cell: it then threads through the
+    # matrix by construction, independent of how far the unwrapped walk drifts.
+    # Break the line wherever it crosses a face (a jump of more than half a box)
+    # so wrapped re-entries are not drawn as spurious chords across the cell.
+    wrapped = tracer - box_l * np.round(tracer / box_l)
+    segments = [wrapped[0]]
+    for i in range(1, len(wrapped)):
+        if np.any(np.abs(wrapped[i] - wrapped[i - 1]) > box_l / 2):
+            segments.append(np.full(3, np.nan))
+        segments.append(wrapped[i])
+    track = np.array(segments)
+    start = wrapped[0]
+
     fig = plt.figure(figsize=(6.8, 6.2))
     ax = fig.add_subplot(111, projection="3d")
     ax.grid(False)
@@ -37,11 +54,17 @@ def main() -> None:
         axis.set_pane_color((1.0, 1.0, 1.0, 0.0))
     ax.scatter(
         crowders[:, 0], crowders[:, 1], crowders[:, 2],
-        s=260, color="#9bb7d4", alpha=0.45, edgecolors="#3a5a80", linewidths=0.5,
+        s=240, color="#9bb7d4", alpha=0.40, edgecolors="#3a5a80", linewidths=0.5,
     )
-    ax.plot(tracer[:, 0], tracer[:, 1], tracer[:, 2], color="#e0467c", lw=1.6)
-    ax.scatter([tracer[0, 0]], [tracer[0, 1]], [tracer[0, 2]], color="k", s=50, marker="*")
+    ax.plot(track[:, 0], track[:, 1], track[:, 2], color="#e0467c", lw=1.7)
+    ax.scatter([start[0]], [start[1]], [start[2]], color="k", s=60, marker="*", zorder=5)
 
+    lo = crowders.min(axis=0) - pad
+    hi = crowders.max(axis=0) + pad
+    ax.set_xlim(lo[0], hi[0])
+    ax.set_ylim(lo[1], hi[1])
+    ax.set_zlim(lo[2], hi[2])
+    ax.set_box_aspect((hi - lo))
     ax.set_xlabel("$x$")
     ax.set_ylabel("$y$")
     ax.set_zlabel("$z$")

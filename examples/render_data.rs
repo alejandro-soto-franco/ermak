@@ -10,6 +10,7 @@
 use ermak::backend::Scenario;
 use ermak::crowding::cubic_lattice;
 use ermak::kinetics::escape_path;
+use ermak::vec3::Vec3;
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -26,17 +27,25 @@ fn main() {
         }
         Some("crowd") => {
             let box_l = 8.0;
-            let crowders = cubic_lattice(box_l, 5);
+            // Centre the lattice on the origin so the tracer (which starts at
+            // the origin) begins *inside* the matrix rather than at a box
+            // corner. Minimum-image forces are translation-invariant on the
+            // torus, so this shifts only the drawing frame, not the physics.
+            let half = box_l / 2.0;
+            let crowders: Vec<Vec3> = cubic_lattice(box_l, 5)
+                .into_iter()
+                .map(|c| Vec3::new(c.x - half, c.y - half, c.z - half))
+                .collect();
             let scenario = Scenario {
                 d0: 1.0,
                 dt: 0.0005,
-                steps: 8_000,
+                steps: 6_000,
                 box_l,
                 sigma: 1.0,
                 eps: 1.0,
                 crowders: crowders.clone(),
             };
-            let path = scenario.path(7, 20);
+            let path = scenario.path(7, 10);
             println!("kind,x,y,z");
             for c in &crowders {
                 println!("crowder,{:.4},{:.4},{:.4}", c.x, c.y, c.z);
