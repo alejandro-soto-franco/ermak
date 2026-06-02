@@ -152,6 +152,41 @@ fn r2_score(y_true: Vec<f64>, y_pred: Vec<f64>) -> f64 {
     ermak_core::ml::r2_score(&y_true, &y_pred)
 }
 
+/// One process-wide GPU backend, initialised on first use. Creating a backend
+/// compiles the CUDA kernel (nvrtc), which is far more expensive than a single
+/// run, so reusing it across calls is what makes repeated GPU calls fast.
+#[cfg(feature = "gpu")]
+mod gpu_cache {
+    use ermak_core::error::ErmakError;
+    use ermak_core::gpu::GpuBackend;
+    use std::sync::{Mutex, OnceLock};
+
+    static BACKEND: OnceLock<Mutex<GpuBackend>> = OnceLock::new();
+
+    /// Run `f` with the shared backend, initialising it (compiling the kernel)
+    /// on the first call only.
+    pub fn with<F, R>(f: F) -> Result<R, ErmakError>
+    where
+        F: FnOnce(&GpuBackend) -> Result<R, ErmakError>,
+    {
+        if BACKEND.get().is_none() {
+            let backend = GpuBackend::new()?;
+            let _ = BACKEND.set(Mutex::new(backend));
+        }
+        let guard = BACKEND
+            .get()
+            .expect("backend set above")
+            .lock()
+            .expect("gpu backend mutex poisoned");
+        f(&guard)
+    }
+
+    /// Whether a device initialises, caching the backend if so.
+    pub fn available() -> bool {
+        with(|_| Ok(())).is_ok()
+    }
+}
+
 /// Whether GPU acceleration is usable from this wheel: it was built with the
 /// `gpu` feature AND a CUDA device initialises now. Always present, so callers
 /// can branch on it without catching an exception.
@@ -159,7 +194,7 @@ fn r2_score(y_true: Vec<f64>, y_pred: Vec<f64>) -> f64 {
 fn gpu_available() -> bool {
     #[cfg(feature = "gpu")]
     {
-        ermak_core::gpu::GpuBackend::new().is_ok()
+        gpu_cache::available()
     }
     #[cfg(not(feature = "gpu"))]
     {
@@ -200,20 +235,20 @@ fn crowded_diffusion_deff_gpu(
             eps,
             crowders: to_vec3(crowders),
         };
-        let gpu = ermak_core::gpu::GpuBackend::new()
-            .map_err(|e| PyRuntimeError::new_err(format!("no CUDA device: {e}")))?;
-        let budget = ermak_core::gpu::device_budget(vram_fraction)
-            .map_err(|e| PyRuntimeError::new_err(format!("device budget: {e}")))?;
-        let t = scenario.steps as f64 * scenario.dt;
-        let sum = match precision {
-            "f64" => gpu.msd_sum(&scenario, replicas, seed, &budget),
-            "f32" => gpu.msd_sum_f32(&scenario, replicas, seed, &budget),
-            other => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "precision must be \"f32\" or \"f64\", got {other:?}"
-                )));
-            }
+        if !matches!(precision, "f32" | "f64") {
+            return Err(PyRuntimeError::new_err(format!(
+                "precision must be \"f32\" or \"f64\", got {precision:?}"
+            )));
         }
+        let t = scenario.steps as f64 * scenario.dt;
+        let sum = gpu_cache::with(|gpu| {
+            let budget = ermak_core::gpu::device_budget(vram_fraction)?;
+            if precision == "f64" {
+                gpu.msd_sum(&scenario, replicas, seed, &budget)
+            } else {
+                gpu.msd_sum_f32(&scenario, replicas, seed, &budget)
+            }
+        })
         .map_err(|e| PyRuntimeError::new_err(format!("gpu run: {e}")))?;
         Ok(sum / (replicas as f64 * 6.0 * t))
     }
