@@ -29,10 +29,13 @@ fn main() {
             let box_l = 8.0;
             // Centre the lattice on the origin so the tracer (which starts at
             // the origin) begins *inside* the matrix rather than at a box
-            // corner. Minimum-image forces are translation-invariant on the
-            // torus, so this shifts only the drawing frame, not the physics.
+            // corner. An even lattice count puts the origin at the symmetric
+            // centre of an empty cell, caged by eight crowders at distance
+            // a*sqrt(3)/2 well outside the WCA core, so the tracer starts in an
+            // interstitial void and is not ejected. Minimum-image forces are
+            // translation-invariant on the torus, so this only shifts the frame.
             let half = box_l / 2.0;
-            let crowders: Vec<Vec3> = cubic_lattice(box_l, 5)
+            let crowders: Vec<Vec3> = cubic_lattice(box_l, 4)
                 .into_iter()
                 .map(|c| Vec3::new(c.x - half, c.y - half, c.z - half))
                 .collect();
