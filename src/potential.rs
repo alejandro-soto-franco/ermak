@@ -72,6 +72,44 @@ pub fn pocket_force(rv: Vec3, barrier: f64, r_b: f64) -> Vec3 {
     rv.scale(-dudr / r)
 }
 
+/// Binding free energy of the pocket, the thermodynamic partner of the kinetic
+/// barrier. The bottleneck barrier sets the off-rate (kinetics); the depth of the
+/// bound well sets the affinity (thermodynamics). Give the well a depth
+/// `well_depth` below the bulk reference, with the same cubic profile rising back
+/// to bulk at the mouth `r_b`,
+///
+/// ```text
+///   U_well(r) = well_depth * ((3 u^2 - 2 u^3) - 1),   u = r / r_b,
+/// ```
+/// so `U_well(0) = -well_depth` (bound) and `U_well(r_b) = 0` (bulk). The binding
+/// free energy is then the configurational Boltzmann integral over the bound
+/// basin against a standard-state volume `v0`,
+///
+/// ```text
+///   dG = -kT ln( (1 / v0) integral_0^{r_b} exp(-U_well(r)/kT) 4 pi r^2 dr ).
+/// ```
+/// For `well_depth = 0` this is `-kT ln(V_b / v0)` with `V_b = 4/3 pi r_b^3`; for
+/// a deep well it tends to `-well_depth + const`, so `well_depth` controls the
+/// affinity. `kt` is `k_B T` in the energy units of `well_depth`; `n` is the
+/// radial quadrature resolution.
+#[must_use]
+pub fn binding_free_energy(r_b: f64, well_depth: f64, kt: f64, v0: f64, n: usize) -> f64 {
+    use std::f64::consts::PI;
+    let n = n.max(2);
+    let h = r_b / n as f64;
+    // trapezoidal integral of exp(-U_well/kT) * 4 pi r^2 over [0, r_b]
+    let mut z = 0.0;
+    for i in 0..=n {
+        let r = i as f64 * h;
+        let u = r / r_b;
+        let u_well = well_depth * ((3.0 * u * u - 2.0 * u * u * u) - 1.0);
+        let w = (-u_well / kt).exp() * 4.0 * PI * r * r;
+        z += if i == 0 || i == n { 0.5 * w } else { w };
+    }
+    z *= h;
+    -kt * (z / v0).ln()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +160,28 @@ mod tests {
         assert!((pocket_energy(r_b, barrier, r_b) - barrier).abs() < 1e-12);
         // Strictly increasing from centre to bottleneck.
         assert!(pocket_energy(1.0, barrier, r_b) > pocket_energy(0.5, barrier, r_b));
+    }
+
+    #[test]
+    fn binding_free_energy_deepens_with_well_and_matches_empty_limit() {
+        use std::f64::consts::PI;
+        let (r_b, kt, v0, n) = (2.0, 1.0, 1.0, 4000);
+        // empty well (depth 0): dG = -kT ln(V_b / v0), V_b = 4/3 pi r_b^3
+        let vb = 4.0 / 3.0 * PI * r_b * r_b * r_b;
+        let g0 = binding_free_energy(r_b, 0.0, kt, v0, n);
+        assert!(
+            (g0 - (-kt * (vb / v0).ln())).abs() < 1e-3,
+            "empty-well dG should be -kT ln(V_b/v0): {g0}"
+        );
+        // deeper well -> stronger (more negative) binding, monotonically
+        let depths = [0.0, 1.0, 2.0, 4.0, 8.0];
+        let gs: Vec<f64> = depths.iter().map(|&e| binding_free_energy(r_b, e, kt, v0, n)).collect();
+        for w in gs.windows(2) {
+            assert!(w[1] < w[0], "dG must decrease with well depth: {:?}", gs);
+        }
+        // deep-well limit: dG ~ -well_depth + const
+        let deep = binding_free_energy(r_b, 12.0, kt, v0, n);
+        assert!(deep < -10.0, "deep well should give strong binding, got {deep}");
     }
 
     #[test]

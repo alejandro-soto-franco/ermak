@@ -88,6 +88,17 @@ fn mean_residence_time(
     ermak_core::kinetics::mean_residence_time(barrier, r_b, d0, dt, max_steps, replicas, seed)
 }
 
+/// Binding free energy of the pocket: the thermodynamic partner of the kinetic
+/// barrier. The bound well has depth `well_depth` below bulk; `dG` is the
+/// configurational Boltzmann integral over the bound basin against standard-state
+/// volume `v0`, in the energy units of `kt` (`k_B T`). Deeper well, stronger
+/// binding. `n` is the radial quadrature resolution.
+#[pyfunction]
+#[pyo3(signature = (r_b, well_depth, kt = 1.0, v0 = 1.0, n = 4000))]
+fn binding_free_energy(r_b: f64, well_depth: f64, kt: f64, v0: f64, n: usize) -> f64 {
+    ermak_core::potential::binding_free_energy(r_b, well_depth, kt, v0, n)
+}
+
 /// Mean tauRAMD egress time under a reoriented random-acceleration force of
 /// magnitude `accel`; the egress times rank the true residence times.
 #[pyfunction]
@@ -326,6 +337,7 @@ fn ermak(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cubic_lattice, m)?)?;
     m.add_function(wrap_pyfunction!(volume_fraction, m)?)?;
     m.add_function(wrap_pyfunction!(mean_residence_time, m)?)?;
+    m.add_function(wrap_pyfunction!(binding_free_energy, m)?)?;
     m.add_function(wrap_pyfunction!(tauramd_egress_time, m)?)?;
     m.add_function(wrap_pyfunction!(escape_path, m)?)?;
     m.add_function(wrap_pyfunction!(r2_score, m)?)?;
