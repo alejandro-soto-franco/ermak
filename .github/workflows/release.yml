@@ -30,14 +30,19 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { os: linux,   runner: ubuntu-latest,  target: x86_64,  manylinux: auto }
-          - { os: linux,   runner: ubuntu-latest,  target: aarch64, manylinux: auto }
+          # The x86_64 Linux wheel is built with the GPU feature: cudarc uses
+          # dynamic-loading, so no CUDA toolchain is needed at build time and the
+          # wheel stays manylinux-portable (it dlopens the driver at runtime, and
+          # gpu_available() returns False where there is none). Other platforms
+          # ship CPU-only; the GPU functions still exist and raise a clear error.
+          - { os: linux,   runner: ubuntu-latest,  target: x86_64,  manylinux: auto, features: "--features gpu" }
+          - { os: linux,   runner: ubuntu-latest,  target: aarch64, manylinux: auto, features: "" }
           # Both macOS wheels build on Apple Silicon: the x86_64 wheel is
           # cross-compiled (Xcode targets both arches natively), so we never
           # request a scarce, being-retired macos-13 Intel runner.
-          - { os: macos,   runner: macos-latest,   target: x86_64,  manylinux: "" }
-          - { os: macos,   runner: macos-latest,   target: aarch64, manylinux: "" }
-          - { os: windows, runner: windows-latest, target: x64,     manylinux: "" }
+          - { os: macos,   runner: macos-latest,   target: x86_64,  manylinux: "", features: "" }
+          - { os: macos,   runner: macos-latest,   target: aarch64, manylinux: "", features: "" }
+          - { os: windows, runner: windows-latest, target: x64,     manylinux: "", features: "" }
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -48,7 +53,7 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
-          args: --release --out dist --manifest-path ermak-py/Cargo.toml
+          args: --release --out dist --manifest-path ermak-py/Cargo.toml ${{ matrix.platform.features }}
           sccache: "true"
       - uses: actions/upload-artifact@v5
         with:

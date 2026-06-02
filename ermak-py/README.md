@@ -37,5 +37,26 @@ forest = ermak.Forest.fit(rows, log_koff, n_trees=200)
 forest.predict_many(rows)
 ```
 
-The wheel is pure Rust with no CUDA dependency; the GPU backend lives in the Rust
-crate behind an opt-in feature. Dual-licensed under MIT or Apache-2.0.
+## GPU
+
+The Linux x86-64 wheel is GPU-accelerated through the CUDA driver API. It needs
+no CUDA toolkit to install (the driver is loaded at runtime); `gpu_available()`
+reports whether a usable device is present.
+
+```python
+import ermak
+
+if ermak.gpu_available():
+    box = 8.0
+    crowders = ermak.cubic_lattice(box, 5)
+    deff = ermak.crowded_diffusion_deff_gpu(
+        d0=1.0, dt=2e-4, steps=10_000, replicas=200_000,
+        box_l=box, crowders=crowders, sigma=1.0, eps=1.0,
+        precision="f32",     # "f64" for the reference path
+    )
+```
+
+`gpu_available()` and `crowded_diffusion_deff_gpu(...)` exist on every wheel; on a
+build or machine without GPU support the latter raises a clear `RuntimeError`, so
+calling code can branch on `gpu_available()`. Dual-licensed under MIT or
+Apache-2.0.

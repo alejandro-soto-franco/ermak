@@ -9,6 +9,7 @@
 
 use ermak_core::ml::{Forest as RsForest, ForestParams};
 use ermak_core::vec3::Vec3;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 fn to_vec3(points: Vec<(f64, f64, f64)>) -> Vec<Vec3> {
@@ -151,6 +152,93 @@ fn r2_score(y_true: Vec<f64>, y_pred: Vec<f64>) -> f64 {
     ermak_core::ml::r2_score(&y_true, &y_pred)
 }
 
+/// Whether GPU acceleration is usable from this wheel: it was built with the
+/// `gpu` feature AND a CUDA device initialises now. Always present, so callers
+/// can branch on it without catching an exception.
+#[pyfunction]
+fn gpu_available() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        ermak_core::gpu::GpuBackend::new().is_ok()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
+}
+
+/// GPU-accelerated crowded effective diffusion: the same observable as
+/// [`crowded_diffusion_deff`], run on the device. `precision` is `"f32"`
+/// (throughput, default) or `"f64"` (the correctness reference). The batch is
+/// sized to `vram_fraction` of free device memory. Raises `RuntimeError` if the
+/// wheel lacks GPU support or no CUDA device is present.
+#[pyfunction]
+#[pyo3(signature = (d0, dt, steps, replicas, box_l, crowders, sigma, eps, seed = 0, precision = "f32", vram_fraction = 0.5))]
+#[allow(clippy::too_many_arguments)]
+fn crowded_diffusion_deff_gpu(
+    d0: f64,
+    dt: f64,
+    steps: usize,
+    replicas: usize,
+    box_l: f64,
+    crowders: Vec<(f64, f64, f64)>,
+    sigma: f64,
+    eps: f64,
+    seed: u64,
+    precision: &str,
+    vram_fraction: f64,
+) -> PyResult<f64> {
+    #[cfg(feature = "gpu")]
+    {
+        use ermak_core::backend::{EnsembleBackend, Scenario};
+        let scenario = Scenario {
+            d0,
+            dt,
+            steps,
+            box_l,
+            sigma,
+            eps,
+            crowders: to_vec3(crowders),
+        };
+        let gpu = ermak_core::gpu::GpuBackend::new()
+            .map_err(|e| PyRuntimeError::new_err(format!("no CUDA device: {e}")))?;
+        let budget = ermak_core::gpu::device_budget(vram_fraction)
+            .map_err(|e| PyRuntimeError::new_err(format!("device budget: {e}")))?;
+        let t = scenario.steps as f64 * scenario.dt;
+        let sum = match precision {
+            "f64" => gpu.msd_sum(&scenario, replicas, seed, &budget),
+            "f32" => gpu.msd_sum_f32(&scenario, replicas, seed, &budget),
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "precision must be \"f32\" or \"f64\", got {other:?}"
+                )));
+            }
+        }
+        .map_err(|e| PyRuntimeError::new_err(format!("gpu run: {e}")))?;
+        Ok(sum / (replicas as f64 * 6.0 * t))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (
+            d0,
+            dt,
+            steps,
+            replicas,
+            box_l,
+            crowders,
+            sigma,
+            eps,
+            seed,
+            precision,
+            vram_fraction,
+        );
+        Err(PyRuntimeError::new_err(
+            "this ermak wheel was built without GPU support (the `gpu` feature); \
+             use crowded_diffusion_deff for the CPU path",
+        ))
+    }
+}
+
 /// A random-forest regressor over CART trees, for predicting `log k_off` (or any
 /// scalar target) from system descriptors.
 #[pyclass]
@@ -206,6 +294,8 @@ fn ermak(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tauramd_egress_time, m)?)?;
     m.add_function(wrap_pyfunction!(escape_path, m)?)?;
     m.add_function(wrap_pyfunction!(r2_score, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
+    m.add_function(wrap_pyfunction!(crowded_diffusion_deff_gpu, m)?)?;
     m.add_class::<Forest>()?;
     Ok(())
 }

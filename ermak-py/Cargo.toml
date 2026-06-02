@@ -1,6 +1,6 @@
 [package]
 name = "ermak-py"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Python bindings for ermak: GPU-accelerated Brownian dynamics for ligand diffusion and dissociation kinetics in crowded environments"
@@ -13,6 +13,13 @@ publish = false
 [lib]
 name = "ermak"
 crate-type = ["cdylib"]
+
+[features]
+# GPU acceleration. Forwards to ermak's `gpu` feature (cudarc with
+# dynamic-loading: no CUDA toolchain is needed at build time, the driver is
+# dlopened at runtime). The Python GPU functions exist regardless; without this
+# feature they raise a clear error.
+gpu = ["ermak_core/gpu"]
 
 [dependencies]
 # Renamed to `ermak_core` in scope so it does not clash with this crate's own

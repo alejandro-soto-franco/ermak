@@ -55,3 +55,23 @@ def test_forest_predicts_koff():
 
 def test_module_has_version():
     assert isinstance(ermak.__version__, str) and ermak.__version__
+
+
+def test_gpu_api_is_uniform():
+    # gpu_available() always exists and returns a bool. The GPU function exists
+    # on every wheel: it computes when a device is present, else raises cleanly.
+    import pytest
+
+    available = ermak.gpu_available()
+    assert isinstance(available, bool)
+
+    box_l = 8.0
+    crowders = ermak.cubic_lattice(box_l, 5)
+    kw = dict(d0=1.0, dt=2e-4, steps=2000, replicas=500,
+              box_l=box_l, crowders=crowders, sigma=1.0, eps=1.0, seed=7)
+    if available:
+        deff = ermak.crowded_diffusion_deff_gpu(precision="f32", **kw)
+        assert 0.0 < deff < 1.0, f"GPU crowded D_eff should sit in (0, D0), got {deff}"
+    else:
+        with pytest.raises(RuntimeError):
+            ermak.crowded_diffusion_deff_gpu(**kw)
