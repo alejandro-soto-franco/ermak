@@ -1,5 +1,5 @@
 //! ermak: Brownian dynamics of ligand diffusion and binding in crowded
-//! environments. See the `ermak-planning` repo for the design spec.
+//! environments.
 
 pub mod backend;
 pub mod crowding;
