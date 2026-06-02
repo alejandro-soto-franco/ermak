@@ -32,7 +32,10 @@ jobs:
         platform:
           - { os: linux,   runner: ubuntu-latest,  target: x86_64,  manylinux: auto }
           - { os: linux,   runner: ubuntu-latest,  target: aarch64, manylinux: auto }
-          - { os: macos,   runner: macos-13,       target: x86_64,  manylinux: "" }
+          # Both macOS wheels build on Apple Silicon: the x86_64 wheel is
+          # cross-compiled (Xcode targets both arches natively), so we never
+          # request a scarce, being-retired macos-13 Intel runner.
+          - { os: macos,   runner: macos-latest,   target: x86_64,  manylinux: "" }
           - { os: macos,   runner: macos-latest,   target: aarch64, manylinux: "" }
           - { os: windows, runner: windows-latest, target: x64,     manylinux: "" }
     steps:
