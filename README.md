@@ -93,6 +93,22 @@ cargo run --release --example ligand_escape > escape.csv
 python scripts/plot_escape.py escape.csv
 ```
 
+On a real congeneric series the same parameter-free model holds up: it ranks the
+residence times of 94 HSP90 inhibitors about as well as atomistic tauRAMD, in
+seconds rather than hours.
+
+![Ranking 94 HSP90 inhibitors against atomistic tauRAMD](docs/hsp90_compare.png)
+
+The recorded escape trajectories also expose the egress routes: a ligand leaves a
+buried pocket through several distinct channels, not a single tunnel.
+
+![Egress pathways from a buried pocket](docs/pathways.png)
+
+A random-forest layer learns `k_off` directly from system descriptors, a step
+toward screening a series without running every trajectory.
+
+![Random-forest k_off prediction against held-out truth](docs/koff_parity.png)
+
 ## Binding thermodynamics
 
 The same pocket also sets the *depth* of binding. Given a well of depth `epsilon`
@@ -107,6 +123,30 @@ so a deeper or wider well binds more tightly (more negative `dG`), and a
 vanishing well returns the ideal reference. This is the thermodynamic companion
 to the `1/k_off` kinetics above: from one pocket, both how fast a ligand leaves
 and how tightly it is held.
+
+![Binding free energy from the pocket well](docs/binding_free_energy.png)
+
+```
+cargo run --release --example binding_free_energy > binding.csv
+python scripts/plot_binding.py binding.csv
+```
+
+Set the well depth from a two-term surface model (hydrophobic burial minus polar
+desolvation) and read it through this integral, and ermak predicts the held-out
+binding free energies of a benzene-derivative series to about 0.26 kcal/mol, well
+ahead of a size-only baseline.
+
+![Held-out binding free energies, surface model vs size only](docs/thermo.png)
+
+## Why the coarse pocket is enough
+
+Coarse-graining away the atoms is not a loss here. In the barrier-and-bottleneck
+limit the atomistic potential of mean force collapses onto exactly the two
+numbers ermak keeps, the barrier height and the bottleneck radius; microscopic
+shape and roughness fall into a prefactor, so the coarse pocket reproduces the
+atomistic rate to within a few percent.
+
+![The pocket reduction: coarse rate vs the atomistic limit](docs/reduction.png)
 
 ## Design
 
@@ -133,6 +173,8 @@ image, drift, and a xoshiro256++ Box-Muller Gaussian kick). The CPU backend
 stays the correctness reference; the GPU reproduces its `D_eff` within a
 statistical tolerance, validated for both free diffusion and crowding.
 
+![GPU reproduces the CPU reference within tolerance](docs/gpu_parity.png)
+
 Memory is guardrailed at three levels, since GPU VRAM is limited (often ~8 GiB):
 
 - **in-process budget**: a request over the cap returns an error instead of
@@ -156,10 +198,11 @@ scripts/run-bounded.sh cargo test --features gpu -- --ignored gpu_
 2. **GPU backend + memory guardrails** (done): a feature-gated CUDA-driver-API
    propagator (one walker per thread) that reproduces the CPU reference, plus
    the in-process / device / OS memory guardrails above.
-3. **Dissociation kinetics** (done): residence time (Kramers limit) and a
-   tauRAMD egress protocol that ranks relative `k_off`. An ML layer predicting
-   `k_off` from system descriptors, and the association rate (Smoluchowski
-   limit), are the remaining pieces.
+3. **Dissociation kinetics + thermodynamics** (done): residence time (Kramers
+   limit), a tauRAMD egress protocol that ranks relative `k_off`, a random-forest
+   `k_off` predictor from system descriptors, and the binding free energy from
+   the pocket well. The association rate (Smoluchowski limit) is the remaining
+   piece.
 
 Phases one and two hold the crowders fixed (a quenched obstacle matrix) and use
 free-draining, isotropic diffusion; mobile crowders and hydrodynamic
