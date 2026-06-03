@@ -4,13 +4,39 @@ Brownian dynamics of ligand diffusion and binding kinetics in crowded
 environments, in Rust.
 
 `ermak` integrates the overdamped Langevin equation with the Ermak-McCammon
-(1978) propagator and uses it to measure, on one engine, the three quantities a
-binding-kinetics study cares about: how molecular crowding slows diffusion, how
-fast a ligand finds its target, and how long it stays bound. Particles are
-coarse-grained spheres in implicit solvent, so the simulations run in seconds on
-a laptop while still reproducing the right analytical and experimental limits.
+(1978) propagator and reads off, from one engine, both faces of binding in a
+crowded cell. The kinetics: how molecular crowding slows diffusion, how fast a
+ligand finds its target, and how long it stays bound (`1/k_off`). And the
+thermodynamics: how tightly it is held, the binding free energy from the pocket
+well. Particles are coarse-grained spheres in implicit solvent, so the
+simulations run in seconds on a laptop while still reproducing the right
+analytical and experimental limits.
+
+The core is Rust; a Python package ships the same engine as a numpy-friendly API.
 
 Named for the Ermak-McCammon Brownian-dynamics algorithm.
+
+## Python package
+
+```
+pip install ermak
+```
+
+The engine ships as an abi3 wheel (no CUDA toolchain required; the GPU path is
+opt-in). The module exposes the crowding, kinetics, and thermodynamics entry
+points:
+
+```python
+import ermak
+
+# configurational binding free energy from the pocket well (kT set via `kt`)
+dG = ermak.binding_free_energy(r_b=1.0, well_depth=8.0, kt=0.593)
+```
+
+Available: `crowded_diffusion_deff` (and `crowded_diffusion_deff_gpu`),
+`free_diffusion_deff`, `mean_residence_time`, `tauramd_egress_time`,
+`escape_path`, `binding_free_energy`, `volume_fraction`, `cubic_lattice`,
+`Forest`, `gpu_available`, `r2_score`.
 
 ## Result: crowders slow tracer diffusion
 
@@ -40,6 +66,7 @@ Every physical claim is pinned to a closed-form limit as a test:
 | Crowding | `D_eff` decreases monotonically with volume fraction | `crowding` |
 | Residence time | grows with the bottleneck barrier (Kramers/Arrhenius) | `kinetics` |
 | tauRAMD | accelerated egress times rank the true residence times | `kinetics` |
+| Binding free energy | a deeper well lowers `dG`; the empty well matches the ideal baseline | `potential` |
 
 ```
 cargo test
@@ -66,12 +93,28 @@ cargo run --release --example ligand_escape > escape.csv
 python scripts/plot_escape.py escape.csv
 ```
 
+## Binding thermodynamics
+
+The same pocket also sets the *depth* of binding. Given a well of depth `epsilon`
+over the bottleneck radius `r_b`, `binding_free_energy` evaluates the
+configurational Boltzmann integral
+
+```
+dG = -kT ln( (1/V0) integral exp(-U_well(r)/kT) 4 pi r^2 dr )
+```
+
+so a deeper or wider well binds more tightly (more negative `dG`), and a
+vanishing well returns the ideal reference. This is the thermodynamic companion
+to the `1/k_off` kinetics above: from one pocket, both how fast a ligand leaves
+and how tightly it is held.
+
 ## Design
 
 - `integrator` : the Ermak-McCammon step as a pure, reproducible function
   (`r' = r + (D / kB T) F dt + R`); the caller supplies the random kick.
 - `potential`  : `Wca` excluded volume and a buried-pocket barrier
-  (`force == -grad energy`, tested).
+  (`force == -grad energy`, tested), plus the binding free energy from the
+  pocket well (the configurational integral above).
 - `rng`        : Gaussian Brownian displacements, `R ~ N(0, 2 D dt)` per axis.
 - `diffusion`  : free-tracer `D_eff` from the ensemble MSD (the `D_0` baseline).
 - `crowding`   : tracer among fixed crowders, periodic minimum image, `D_eff(phi)`.
@@ -124,4 +167,4 @@ interactions (Rotne-Prager-Yamakawa) are the planned extensions.
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+Licensed under the Apache License, Version 2.0. See `LICENSE-APACHE`.
