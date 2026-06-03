@@ -1,9 +1,9 @@
 [package]
 name = "ermak-py"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Python bindings for ermak: GPU-accelerated Brownian dynamics for ligand diffusion and dissociation kinetics in crowded environments"
+description = "Python bindings for ermak: GPU-accelerated Brownian dynamics for ligand diffusion, dissociation kinetics, and binding thermodynamics in crowded environments"
 repository = "https://github.com/alejandro-soto-franco/ermak"
 publish = false
 
