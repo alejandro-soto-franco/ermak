@@ -4,6 +4,8 @@
 //! other through one shared mobility matrix.
 
 pub mod ewald;
+#[cfg(feature = "gpu")]
+pub mod gpu_ewald;
 pub mod mat3;
 pub mod mobility;
 pub mod noise;
@@ -185,7 +187,7 @@ mod step_tests {
         for r in 0..3 {
             for c in 0..3 {
                 assert!(
-                    l[(3 * 1 + r) * dim + c].abs() < 1e-15,
+                    l[(3 + r) * dim + c].abs() < 1e-15,
                     "HI-off L cross block nonzero"
                 );
             }
