@@ -129,6 +129,107 @@ extern "C" __global__ void ewald_apply(
     }
     u[3*i+0] = ux; u[3*i+1] = uy; u[3*i+2] = uz;
 }
+
+// Batched variant: nvec stacked force vectors per launch (force/u are nvec x 3N,
+// row-major; vector v at offset v*3*n). One thread per (v, i). Identical block
+// math to ewald_apply; only the index prologue and the force/u offsets differ.
+// The blocks are recomputed per (v, i) on purpose: at the validated N the host
+// round-trip, not the block compute, is the bottleneck, and one launch now
+// serves all nvec vectors.
+extern "C" __global__ void ewald_apply_batched(
+    double *u, const double *pos, const double *force, int n, int nvec,
+    double box_l, double sigma, double r_cut, int k_max, double a)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * nvec;
+    if (t >= total) return;
+    int v = t / n;
+    int i = t - v * n;
+    const double *fv = force + (long)v * 3 * n;
+    double *uv = u + (long)v * 3 * n;
+
+    const double PI = 3.14159265358979323846;
+    const double s = sigma;
+    const double s2 = s * s;
+    const double a2 = a * a;
+    const double vol = box_l * box_l * box_l;
+    const double two_a2 = 2.0 * a2;
+    const double p23a2 = two_a2 / 3.0;
+    const double sqrt2 = 1.41421356237309504880;
+    const double sqrt2pi = 2.50662827463100050242; // sqrt(2 pi)
+    const double backflow = -(s2 * PI / (2.0 * vol));
+    const double mu0 = 1.0 / (6.0 * a);
+    const double self_analytic = (a2 / (9.0 * s2) - 1.0) / (4.0 * sqrt2pi * s);
+    int span = (int)ceil(r_cut / box_l) + 1;
+
+    double xi = pos[3*i+0], yi = pos[3*i+1], zi = pos[3*i+2];
+    double ux = 0.0, uy = 0.0, uz = 0.0;
+
+    for (int j = 0; j < n; j++) {
+        int is_self = (j == i);
+        double rijx = xi - pos[3*j+0];
+        double rijy = yi - pos[3*j+1];
+        double rijz = zi - pos[3*j+2];
+
+        double m00=0,m01=0,m02=0,m10=0,m11=0,m12=0,m20=0,m21=0,m22=0;
+
+        for (int nx = -span; nx <= span; nx++)
+        for (int ny = -span; ny <= span; ny++)
+        for (int nz = -span; nz <= span; nz++) {
+            if (is_self && nx==0 && ny==0 && nz==0) continue;
+            double dx = rijx + nx * box_l;
+            double dy = rijy + ny * box_l;
+            double dz = rijz + nz * box_l;
+            double r2 = dx*dx + dy*dy + dz*dz;
+            double r = sqrt(r2);
+            if (r > r_cut || r == 0.0) continue;
+            double r3 = r2 * r;
+            double ex = dx / r, ey = dy / r, ez = dz / r;
+            double ec = erfc_as(r / (s * sqrt2));
+            double id_coef = (1.0/r + p23a2/r3) / 8.0 * ec;
+            double rr_coef = (1.0/r - 3.0*p23a2/r3) / 8.0 * ec;
+            double p_i = two_a2 * (1.0/(6.0*s2) + 1.0/(3.0*r2));
+            double p_rr = two_a2 * (r2/(6.0*s2*s2) - 1.0/(3.0*s2) - 1.0/r2) + 1.0;
+            double pre = exp(-r2/(2.0*s2)) / (4.0 * sqrt2pi * s);
+            double id_part = id_coef + p_i * pre;
+            double rr_part = rr_coef + p_rr * pre;
+            m00 += id_part + rr_part*ex*ex; m01 += rr_part*ex*ey; m02 += rr_part*ex*ez;
+            m10 += rr_part*ey*ex; m11 += id_part + rr_part*ey*ey; m12 += rr_part*ey*ez;
+            m20 += rr_part*ez*ex; m21 += rr_part*ez*ey; m22 += id_part + rr_part*ez*ez;
+        }
+
+        double two_pi_l = 2.0 * PI / box_l;
+        for (int kx = -k_max; kx <= k_max; kx++)
+        for (int ky = -k_max; ky <= k_max; ky++)
+        for (int kz = -k_max; kz <= k_max; kz++) {
+            if (kx==0 && ky==0 && kz==0) continue;
+            double kvx = kx * two_pi_l, kvy = ky * two_pi_l, kvz = kz * two_pi_l;
+            double k2 = kvx*kvx + kvy*kvy + kvz*kvz;
+            double k = sqrt(k2);
+            double hx = kvx/k, hy = kvy/k, hz = kvz/k;
+            double pre = (PI/vol) * (1.0/k2 - a2/3.0) * exp(-k2*s2/2.0);
+            double coef = 1.0 + s2*k2/2.0;
+            double phase = cos(kvx*rijx + kvy*rijy + kvz*rijz);
+            double w = pre * phase;
+            m00 += w*(1.0 - coef*hx*hx); m01 += w*(-coef*hx*hy); m02 += w*(-coef*hx*hz);
+            m10 += w*(-coef*hy*hx); m11 += w*(1.0 - coef*hy*hy); m12 += w*(-coef*hy*hz);
+            m20 += w*(-coef*hz*hx); m21 += w*(-coef*hz*hy); m22 += w*(1.0 - coef*hz*hz);
+        }
+
+        if (is_self) {
+            double d = mu0 + self_analytic + backflow;
+            m00 += d; m11 += d; m22 += d;
+        } else {
+            m00 += backflow; m11 += backflow; m22 += backflow;
+        }
+
+        double fx = fv[3*j+0], fy = fv[3*j+1], fz = fv[3*j+2];
+        ux += m00*fx + m01*fy + m02*fz;
+        uy += m10*fx + m11*fy + m12*fz;
+        uz += m20*fx + m21*fy + m22*fz;
+    }
+    uv[3*i+0] = ux; uv[3*i+1] = uy; uv[3*i+2] = uz;
+}
 "#;
 
 /// GPU periodic RPY mobility-apply. Holds the CUDA context, stream, and kernel.
@@ -136,6 +237,7 @@ pub struct GpuEwald {
     _ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     func: CudaFunction,
+    func_batched: CudaFunction,
 }
 
 impl GpuEwald {
@@ -151,10 +253,14 @@ impl GpuEwald {
             .map_err(|e| ErmakError::Gpu(format!("nvrtc compile: {e:?}")))?;
         let module = ctx.load_module(ptx).map_err(driver_err)?;
         let func = module.load_function("ewald_apply").map_err(driver_err)?;
+        let func_batched = module
+            .load_function("ewald_apply_batched")
+            .map_err(driver_err)?;
         Ok(Self {
             _ctx: ctx,
             stream,
             func,
+            func_batched,
         })
     }
 
@@ -214,6 +320,66 @@ impl GpuEwald {
         Ok((0..n)
             .map(|i| Vec3::new(out[3 * i], out[3 * i + 1], out[3 * i + 2]))
             .collect())
+    }
+
+    /// Batched mobility apply: `forces` is `nvec` stacked `3N` vectors (row-major,
+    /// vector `v` at `[v*3N .. v*3N+3N]`); returns the same layout with
+    /// `U^{(v)} = M F^{(v)}`. One launch and one host round-trip for all `nvec`,
+    /// which is the round-trip-bound regime's win over `nvec` single applies.
+    ///
+    /// # Panics
+    /// If `forces.len() != nvec * 3 * pos.len()`.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any driver error.
+    pub fn apply_mobility_gpu_batched(
+        &self,
+        pos: &[Vec3],
+        forces: &[f64],
+        nvec: usize,
+        ep: &EwaldParams,
+    ) -> Result<Vec<f64>, ErmakError> {
+        let n = pos.len();
+        assert_eq!(forces.len(), nvec * 3 * n, "forces length must be nvec*3N");
+        let host_pos: Vec<f64> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+        let d_pos = self.stream.clone_htod(&host_pos).map_err(driver_err)?;
+        let d_f = self
+            .stream
+            .clone_htod(&forces.to_vec())
+            .map_err(driver_err)?;
+        let mut d_u = self
+            .stream
+            .alloc_zeros::<f64>(nvec * 3 * n)
+            .map_err(driver_err)?;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let n_i = n as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let nvec_i = nvec as i32;
+        let (box_l, sigma, r_cut, a) = (ep.box_l, ep.sigma, ep.r_cut, ep.a);
+        let k_max = ep.k_max;
+
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let total = (n * nvec) as u32;
+        let block = 64u32;
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(block), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = self.stream.launch_builder(&self.func_batched);
+        b.arg(&mut d_u);
+        b.arg(&d_pos);
+        b.arg(&d_f);
+        b.arg(&n_i);
+        b.arg(&nvec_i);
+        b.arg(&box_l);
+        b.arg(&sigma);
+        b.arg(&r_cut);
+        b.arg(&k_max);
+        b.arg(&a);
+        unsafe { b.launch(cfg) }.map_err(driver_err)?;
+        self.stream.clone_dtoh(&d_u).map_err(driver_err)
     }
 }
 
@@ -303,6 +469,59 @@ mod tests {
         assert!(
             max_abs < 1e-9,
             "GPU mobility-apply must match CPU oracle; max_abs {max_abs:.3e}"
+        );
+    }
+
+    // Requires a CUDA GPU. cargo test --features gpu -- --ignored gpu_batched_matches
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_batched_matches_single() {
+        let l = 10.0;
+        let ep = EwaldParams {
+            box_l: l,
+            sigma: 2.5,
+            r_cut: 13.0,
+            k_max: 8,
+            a: 1.0,
+        };
+        let n = 6usize;
+        let pos = random_box(n, l, 7);
+        let nvec = 5usize;
+        let mut rng = StdRng::seed_from_u64(42);
+        let forces: Vec<f64> = (0..nvec * 3 * n)
+            .map(|_| rng.gen_range(-1.0..1.0))
+            .collect();
+
+        let dev = GpuEwald::new().expect("cuda");
+        let batched = dev
+            .apply_mobility_gpu_batched(&pos, &forces, nvec, &ep)
+            .expect("batched");
+        let mut max_abs = 0.0f64;
+        for v in 0..nvec {
+            let fv: Vec<Vec3> = (0..n)
+                .map(|i| {
+                    Vec3::new(
+                        forces[v * 3 * n + 3 * i],
+                        forces[v * 3 * n + 3 * i + 1],
+                        forces[v * 3 * n + 3 * i + 2],
+                    )
+                })
+                .collect();
+            let single = dev.apply_mobility_gpu(&pos, &fv, &ep).expect("single");
+            for i in 0..n {
+                for (a, b) in [
+                    (batched[v * 3 * n + 3 * i], single[i].x),
+                    (batched[v * 3 * n + 3 * i + 1], single[i].y),
+                    (batched[v * 3 * n + 3 * i + 2], single[i].z),
+                ] {
+                    max_abs = max_abs.max((a - b).abs());
+                }
+            }
+        }
+        eprintln!("batched vs single: max_abs={max_abs:.3e}");
+        assert!(
+            max_abs < 1e-12,
+            "batched apply must equal single apply; {max_abs:.3e}"
         );
     }
 }
