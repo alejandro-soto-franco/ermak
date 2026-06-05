@@ -3,6 +3,8 @@
 //! independent single-tracer walkers, every particle here couples to every
 //! other through one shared mobility matrix.
 
+// pub mod ewald;  // WIP (Milestone B): Beenakker-Ewald coefficients fail the
+// alpha-invariance gate; needs the exact reference formulas before wiring in.
 pub mod mat3;
 pub mod mobility;
 pub mod noise;
@@ -111,10 +113,23 @@ mod step_tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
-    const FREE: ForceParams = ForceParams { sigma: 1.0, eps: 1.0, k_e: 0.0, kappa: 1.0, cut: 0.0 };
+    const FREE: ForceParams = ForceParams {
+        sigma: 1.0,
+        eps: 1.0,
+        k_e: 0.0,
+        kappa: 1.0,
+        cut: 0.0,
+    };
 
     fn one_particle(eta: f64, a: f64) -> HydroSystem {
-        HydroSystem { pos: vec![Vec3::ZERO], radius: vec![a], charge: vec![0.0], eta, kt: 1.0, box_l: None }
+        HydroSystem {
+            pos: vec![Vec3::ZERO],
+            radius: vec![a],
+            charge: vec![0.0],
+            eta,
+            kt: 1.0,
+            box_l: None,
+        }
     }
 
     #[test]
@@ -136,7 +151,10 @@ mod step_tests {
         }
         let deff = msd / (replicas as f64 * 6.0 * steps as f64 * dt);
         let rel = (deff - d0).abs() / d0;
-        assert!(rel < 0.05, "single-particle D_eff {deff:.4} vs D0 {d0:.4} (rel {rel:.3})");
+        assert!(
+            rel < 0.05,
+            "single-particle D_eff {deff:.4} vs D0 {d0:.4} (rel {rel:.3})"
+        );
     }
 
     #[test]
@@ -144,17 +162,34 @@ mod step_tests {
         // With hydro_on=false and no forces, each particle diffuses with its own
         // mu0; the cross block of the Cholesky factor must vanish.
         let sys = HydroSystem {
-            pos: vec![Vec3::ZERO, Vec3::new(2.5, 0.0, 0.0)], radius: vec![1.0, 1.0],
-            charge: vec![0.0, 0.0], eta: 1.0 / (6.0 * std::f64::consts::PI), kt: 1.0, box_l: None,
+            pos: vec![Vec3::ZERO, Vec3::new(2.5, 0.0, 0.0)],
+            radius: vec![1.0, 1.0],
+            charge: vec![0.0, 0.0],
+            eta: 1.0 / (6.0 * std::f64::consts::PI),
+            kt: 1.0,
+            box_l: None,
         };
         let dim = 6;
         let mut m = grand_mobility(&sys);
-        for i in 0..2 { for j in 0..2 { if i != j {
-            for r in 0..3 { for c in 0..3 { m[(3*i+r)*dim+(3*j+c)] = 0.0; }}
-        }}}
+        for i in 0..2 {
+            for j in 0..2 {
+                if i != j {
+                    for r in 0..3 {
+                        for c in 0..3 {
+                            m[(3 * i + r) * dim + (3 * j + c)] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
         let l = cholesky(&m, dim).unwrap();
-        for r in 0..3 { for c in 0..3 {
-            assert!(l[(3*1+r)*dim + c].abs() < 1e-15, "HI-off L cross block nonzero");
-        }}
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!(
+                    l[(3 * 1 + r) * dim + c].abs() < 1e-15,
+                    "HI-off L cross block nonzero"
+                );
+            }
+        }
     }
 }

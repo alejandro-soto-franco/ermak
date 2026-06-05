@@ -19,9 +19,15 @@ impl Mat3 {
     #[must_use]
     pub fn outer(e: Vec3) -> Mat3 {
         Mat3([
-            e.x * e.x, e.x * e.y, e.x * e.z,
-            e.y * e.x, e.y * e.y, e.y * e.z,
-            e.z * e.x, e.z * e.y, e.z * e.z,
+            e.x * e.x,
+            e.x * e.y,
+            e.x * e.z,
+            e.y * e.x,
+            e.y * e.y,
+            e.y * e.z,
+            e.z * e.x,
+            e.z * e.y,
+            e.z * e.z,
         ])
     }
 
@@ -34,11 +40,14 @@ impl Mat3 {
         Mat3(m)
     }
 
+    // Named `add` (not the `Add` trait) deliberately: the tensor algebra reads as
+    // chained `.scale(..).add(..)` calls, which is clearer here than operators.
+    #[allow(clippy::should_implement_trait)]
     #[must_use]
     pub fn add(self, other: Mat3) -> Mat3 {
         let mut m = self.0;
-        for i in 0..9 {
-            m[i] += other.0[i];
+        for (mi, oi) in m.iter_mut().zip(other.0.iter()) {
+            *mi += *oi;
         }
         Mat3(m)
     }
@@ -62,12 +71,18 @@ mod tests {
     #[test]
     fn identity_outer_scale_add_and_mulvec() {
         let i = Mat3::identity();
-        assert_eq!(i.mul_vec(Vec3::new(2.0, 3.0, 4.0)), Vec3::new(2.0, 3.0, 4.0));
+        assert_eq!(
+            i.mul_vec(Vec3::new(2.0, 3.0, 4.0)),
+            Vec3::new(2.0, 3.0, 4.0)
+        );
         // e e^T applied to e gives |e|^2 e; for a unit vector that is e itself.
         let e = Vec3::new(1.0, 0.0, 0.0);
         assert_eq!(Mat3::outer(e).mul_vec(e), e);
         // (2 I + 0) scales by 2
         let m = i.scale(2.0).add(Mat3::ZERO);
-        assert_eq!(m.mul_vec(Vec3::new(1.0, 1.0, 1.0)), Vec3::new(2.0, 2.0, 2.0));
+        assert_eq!(
+            m.mul_vec(Vec3::new(1.0, 1.0, 1.0)),
+            Vec3::new(2.0, 2.0, 2.0)
+        );
     }
 }

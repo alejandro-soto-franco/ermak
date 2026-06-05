@@ -19,7 +19,12 @@ pub fn grand_mobility(sys: &HydroSystem) -> Vec<f64> {
             m[(3 * i + d) * dim + (3 * i + d)] = mu0;
         }
         for j in (i + 1)..n {
-            let block = rpyw_pair(sys.pos[i] - sys.pos[j], sys.radius[i], sys.radius[j], sys.eta);
+            let block = rpyw_pair(
+                sys.pos[i] - sys.pos[j],
+                sys.radius[i],
+                sys.radius[j],
+                sys.eta,
+            );
             for r in 0..3 {
                 for c in 0..3 {
                     let v = block.0[3 * r + c];
@@ -87,16 +92,29 @@ pub fn apply_mobility(m: &[f64], forces: &[crate::vec3::Vec3]) -> Vec<crate::vec
 mod tests {
     use super::*;
     use crate::vec3::Vec3;
+    use rand::Rng;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use rand::Rng;
 
     fn random_system(n: usize, seed: u64) -> HydroSystem {
         let mut rng = StdRng::seed_from_u64(seed);
         let pos = (0..n)
-            .map(|_| Vec3::new(rng.gen_range(0.0..20.0), rng.gen_range(0.0..20.0), rng.gen_range(0.0..20.0)))
+            .map(|_| {
+                Vec3::new(
+                    rng.gen_range(0.0..20.0),
+                    rng.gen_range(0.0..20.0),
+                    rng.gen_range(0.0..20.0),
+                )
+            })
             .collect();
-        HydroSystem { pos, radius: vec![1.0; n], charge: vec![0.0; n], eta: 1.0, kt: 1.0, box_l: None }
+        HydroSystem {
+            pos,
+            radius: vec![1.0; n],
+            charge: vec![0.0; n],
+            eta: 1.0,
+            kt: 1.0,
+            box_l: None,
+        }
     }
 
     #[test]
@@ -106,7 +124,10 @@ mod tests {
         let dim = 3 * sys.n();
         for i in 0..dim {
             for j in 0..dim {
-                assert!((m[i * dim + j] - m[j * dim + i]).abs() < 1e-14, "asym at {i},{j}");
+                assert!(
+                    (m[i * dim + j] - m[j * dim + i]).abs() < 1e-14,
+                    "asym at {i},{j}"
+                );
             }
         }
     }
@@ -134,7 +155,10 @@ mod tests {
                 for k in 0..dim {
                     s += l[i * dim + k] * l[j * dim + k];
                 }
-                assert!((s - m[i * dim + j]).abs() < 1e-9, "LL^T mismatch at {i},{j}");
+                assert!(
+                    (s - m[i * dim + j]).abs() < 1e-9,
+                    "LL^T mismatch at {i},{j}"
+                );
             }
         }
     }
@@ -143,8 +167,12 @@ mod tests {
     fn single_particle_drift_is_mu0_force() {
         // One particle: U = mu0 F (no cross coupling).
         let sys = HydroSystem {
-            pos: vec![Vec3::ZERO], radius: vec![2.0], charge: vec![0.0],
-            eta: 1.0, kt: 1.0, box_l: None,
+            pos: vec![Vec3::ZERO],
+            radius: vec![2.0],
+            charge: vec![0.0],
+            eta: 1.0,
+            kt: 1.0,
+            box_l: None,
         };
         let m = grand_mobility(&sys);
         let f = vec![Vec3::new(0.0, 0.0, 3.0)];
@@ -159,8 +187,12 @@ mod tests {
         // Two particles on x; push i in +x. HI drags j in +x too (entrainment):
         // the xx cross-mobility is positive.
         let sys = HydroSystem {
-            pos: vec![Vec3::ZERO, Vec3::new(5.0, 0.0, 0.0)], radius: vec![1.0, 1.0],
-            charge: vec![0.0, 0.0], eta: 1.0, kt: 1.0, box_l: None,
+            pos: vec![Vec3::ZERO, Vec3::new(5.0, 0.0, 0.0)],
+            radius: vec![1.0, 1.0],
+            charge: vec![0.0, 0.0],
+            eta: 1.0,
+            kt: 1.0,
+            box_l: None,
         };
         let m = grand_mobility(&sys);
         let f = vec![Vec3::new(1.0, 0.0, 0.0), Vec3::ZERO];
@@ -173,9 +205,24 @@ mod tests {
     fn polydisperse_mobility_is_spd() {
         let mut rng = StdRng::seed_from_u64(99);
         let n = 8;
-        let pos = (0..n).map(|_| Vec3::new(rng.gen_range(0.0..15.0), rng.gen_range(0.0..15.0), rng.gen_range(0.0..15.0))).collect();
+        let pos = (0..n)
+            .map(|_| {
+                Vec3::new(
+                    rng.gen_range(0.0..15.0),
+                    rng.gen_range(0.0..15.0),
+                    rng.gen_range(0.0..15.0),
+                )
+            })
+            .collect();
         let radius = (0..n).map(|_| rng.gen_range(0.5..2.5)).collect();
-        let sys = HydroSystem { pos, radius, charge: vec![0.0; n], eta: 1.0, kt: 1.0, box_l: None };
+        let sys = HydroSystem {
+            pos,
+            radius,
+            charge: vec![0.0; n],
+            eta: 1.0,
+            kt: 1.0,
+            box_l: None,
+        };
         let m = grand_mobility(&sys);
         assert!(cholesky(&m, 3 * n).is_ok(), "polydisperse mobility not SPD");
     }

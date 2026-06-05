@@ -88,8 +88,7 @@ pub fn rpyw_pair(r_vec: Vec3, ai: f64, aj: f64, eta: f64) -> Mat3 {
         // overlapping, neither centre inside the other
         let s = r;
         let base = 1.0 / (6.0 * PI * eta * ai * aj);
-        let a_coeff = base
-            * (16.0 * s.powi(3) * sum - ((ai - aj).powi(2) + 3.0 * s * s).powi(2))
+        let a_coeff = base * (16.0 * s.powi(3) * sum - ((ai - aj).powi(2) + 3.0 * s * s).powi(2))
             / (32.0 * s.powi(3));
         let b_coeff = base * (3.0 * ((ai - aj).powi(2) - s * s).powi(2)) / (32.0 * s.powi(3));
         id.scale(a_coeff).add(ee.scale(b_coeff))
@@ -114,7 +113,12 @@ mod rpyw_tests {
             let eq = rpy_pair_equal(v, a, ETA);
             let gw = rpyw_pair(v, a, a, ETA);
             for k in 0..9 {
-                assert!((eq.0[k] - gw.0[k]).abs() < 1e-9, "r={r} block {k}: {} vs {}", eq.0[k], gw.0[k]);
+                assert!(
+                    (eq.0[k] - gw.0[k]).abs() < 1e-9,
+                    "r={r} block {k}: {} vs {}",
+                    eq.0[k],
+                    gw.0[k]
+                );
             }
         }
     }
@@ -126,7 +130,12 @@ mod rpyw_tests {
         let inner = rpyw_pair(Vec3::new(ai + aj - eps, 0.0, 0.0), ai, aj, ETA);
         let outer = rpyw_pair(Vec3::new(ai + aj + eps, 0.0, 0.0), ai, aj, ETA);
         for k in 0..9 {
-            assert!((inner.0[k] - outer.0[k]).abs() < 1e-4, "block {k}: {} vs {}", inner.0[k], outer.0[k]);
+            assert!(
+                (inner.0[k] - outer.0[k]).abs() < 1e-4,
+                "block {k}: {} vs {}",
+                inner.0[k],
+                outer.0[k]
+            );
         }
     }
 }

@@ -257,9 +257,15 @@ mod tests {
         let r = 1.7;
         let h = 1e-6;
         let dudr = (yukawa_energy(r + h, qi, qj, k_e, kappa, cutoff)
-            - yukawa_energy(r - h, qi, qj, k_e, kappa, cutoff)) / (2.0 * h);
+            - yukawa_energy(r - h, qi, qj, k_e, kappa, cutoff))
+            / (2.0 * h);
         let f = yukawa_pair_force(Vec3::new(r, 0.0, 0.0), qi, qj, k_e, kappa, cutoff);
-        assert!((f.x - (-dudr)).abs() < 1e-5, "F_x={} vs -dU/dr={}", f.x, -dudr);
+        assert!(
+            (f.x - (-dudr)).abs() < 1e-5,
+            "F_x={} vs -dU/dr={}",
+            f.x,
+            -dudr
+        );
     }
 
     #[test]
@@ -277,6 +283,9 @@ mod tests {
         let v = Vec3::new(3.0, 0.0, 0.0);
         let weak = yukawa_pair_force(v, 1.0, 1.0, 1.0, 0.1, 50.0).x;
         let strong = yukawa_pair_force(v, 1.0, 1.0, 1.0, 1.0, 50.0).x;
-        assert!(strong < weak, "more screening -> weaker force: {strong} vs {weak}");
+        assert!(
+            strong < weak,
+            "more screening -> weaker force: {strong} vs {weak}"
+        );
     }
 }

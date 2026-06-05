@@ -9,13 +9,19 @@ use rand_distr::{Distribution, Normal};
 /// Draw the correlated displacement for one step. `l` is the precomputed lower
 /// Cholesky factor of the grand mobility (3N x 3N row-major), `dim = 3N`.
 #[must_use]
-pub fn correlated_noise<R: Rng + ?Sized>(l: &[f64], dim: usize, kt: f64, dt: f64, rng: &mut R) -> Vec<Vec3> {
+pub fn correlated_noise<R: Rng + ?Sized>(
+    l: &[f64],
+    dim: usize,
+    kt: f64,
+    dt: f64,
+    rng: &mut R,
+) -> Vec<Vec3> {
     let normal = Normal::new(0.0, 1.0).expect("unit normal");
     let xi: Vec<f64> = (0..dim).map(|_| normal.sample(rng)).collect();
     let scale = (2.0 * kt * dt).sqrt();
     let n = dim / 3;
     let mut out = vec![Vec3::ZERO; n];
-    for i in 0..n {
+    for (i, slot) in out.iter_mut().enumerate() {
         let mut comp = [0.0f64; 3];
         for (d, c) in comp.iter_mut().enumerate() {
             // lower-triangular: row (3i+d) dotted with xi up to that column
@@ -26,13 +32,19 @@ pub fn correlated_noise<R: Rng + ?Sized>(l: &[f64], dim: usize, kt: f64, dt: f64
             }
             *c = scale * s;
         }
-        out[i] = Vec3::new(comp[0], comp[1], comp[2]);
+        *slot = Vec3::new(comp[0], comp[1], comp[2]);
     }
     out
 }
 
 /// Convenience: factor `m` then draw. Returns `Err(k)` if `m` is not SPD.
-pub fn correlated_noise_from_m<R: Rng + ?Sized>(m: &[f64], dim: usize, kt: f64, dt: f64, rng: &mut R) -> Result<Vec<Vec3>, usize> {
+pub fn correlated_noise_from_m<R: Rng + ?Sized>(
+    m: &[f64],
+    dim: usize,
+    kt: f64,
+    dt: f64,
+    rng: &mut R,
+) -> Result<Vec<Vec3>, usize> {
     let l = cholesky(m, dim)?;
     Ok(correlated_noise(&l, dim, kt, dt, rng))
 }
@@ -49,8 +61,12 @@ mod tests {
     fn sample_covariance_matches_2_kt_dt_m() {
         // Two close particles so the cross-covariance is clearly non-zero.
         let sys = HydroSystem {
-            pos: vec![Vec3::ZERO, Vec3::new(3.0, 0.0, 0.0)], radius: vec![1.0, 1.0],
-            charge: vec![0.0, 0.0], eta: 1.0 / (6.0 * std::f64::consts::PI), kt: 1.3, box_l: None,
+            pos: vec![Vec3::ZERO, Vec3::new(3.0, 0.0, 0.0)],
+            radius: vec![1.0, 1.0],
+            charge: vec![0.0, 0.0],
+            eta: 1.0 / (6.0 * std::f64::consts::PI),
+            kt: 1.3,
+            box_l: None,
         };
         let m = grand_mobility(&sys);
         let dim = 3 * sys.n();
