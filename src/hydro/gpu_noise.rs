@@ -239,6 +239,163 @@ pub fn brownian_noise_gpu<R: Rng + ?Sized>(
         .collect())
 }
 
+/// Batched correlated noise: `nvec` independent draws of `sqrt(2 kT dt) M^{1/2} xi`,
+/// run in lockstep so each Krylov step is a single batched device matvec. Returns
+/// `nvec` draws (each `n` Vec3). Equivalent in distribution to calling
+/// `brownian_noise_gpu` `nvec` times, with about `nvec`x fewer host round-trips.
+///
+/// # Errors
+/// [`ErmakError::Gpu`] on any device error.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub fn brownian_noise_gpu_batched<R: Rng + ?Sized>(
+    dev: &GpuEwald,
+    pos: &[Vec3],
+    ep: &EwaldParams,
+    kt: f64,
+    dt: f64,
+    m_iters: usize,
+    nvec: usize,
+    rng: &mut R,
+) -> Result<Vec<Vec<Vec3>>, ErmakError> {
+    let n = pos.len();
+    let dim = 3 * n;
+    let normal = Normal::new(0.0, 1.0).expect("unit normal");
+
+    let mut beta0 = vec![0.0f64; nvec];
+    let mut v: Vec<Vec<f64>> = Vec::with_capacity(nvec);
+    let mut basis: Vec<Vec<Vec<f64>>> = vec![Vec::new(); nvec];
+    let mut alpha: Vec<Vec<f64>> = vec![Vec::new(); nvec];
+    let mut beta: Vec<Vec<f64>> = vec![Vec::new(); nvec];
+    let mut active = vec![true; nvec];
+
+    for d in 0..nvec {
+        let xi: Vec<f64> = (0..dim).map(|_| normal.sample(rng)).collect();
+        let b0 = dot(&xi, &xi).sqrt();
+        beta0[d] = b0;
+        let v0: Vec<f64> = if b0 == 0.0 {
+            active[d] = false;
+            vec![0.0; dim]
+        } else {
+            xi.iter().map(|x| x / b0).collect()
+        };
+        basis[d].push(v0.clone());
+        v.push(v0);
+    }
+
+    // one batched matvec over the current `v` of every draw
+    let matvec_all = |vs: &[Vec<f64>]| -> Result<Vec<Vec<f64>>, ErmakError> {
+        let mut flat = vec![0.0f64; nvec * dim];
+        for (d, vd) in vs.iter().enumerate() {
+            flat[d * dim..(d + 1) * dim].copy_from_slice(vd);
+        }
+        let out = dev.apply_mobility_gpu_batched(pos, &flat, nvec, ep)?;
+        Ok((0..nvec)
+            .map(|d| out[d * dim..(d + 1) * dim].to_vec())
+            .collect())
+    };
+
+    let mut w_all = matvec_all(&v)?;
+    let mut vprev = v.clone();
+    for d in 0..nvec {
+        if !active[d] {
+            continue;
+        }
+        let a0 = dot(&w_all[d], &v[d]);
+        alpha[d].push(a0);
+        for k in 0..dim {
+            w_all[d][k] -= a0 * v[d][k];
+        }
+        for bv in &basis[d] {
+            let c = dot(&w_all[d], bv);
+            for k in 0..dim {
+                w_all[d][k] -= c * bv[k];
+            }
+        }
+    }
+
+    for _ in 1..m_iters {
+        for d in 0..nvec {
+            if !active[d] {
+                continue;
+            }
+            let bj = dot(&w_all[d], &w_all[d]).sqrt();
+            if bj < 1e-14 {
+                active[d] = false;
+                continue;
+            }
+            beta[d].push(bj);
+            vprev[d] = v[d].clone();
+            v[d] = w_all[d].iter().map(|x| x / bj).collect();
+            basis[d].push(v[d].clone());
+        }
+        w_all = matvec_all(&v)?;
+        for d in 0..nvec {
+            if !active[d] {
+                continue;
+            }
+            let bjlast = *beta[d].last().unwrap();
+            let aj = dot(&w_all[d], &v[d]);
+            alpha[d].push(aj);
+            for k in 0..dim {
+                w_all[d][k] -= aj * v[d][k] + bjlast * vprev[d][k];
+            }
+            for bv in &basis[d] {
+                let c = dot(&w_all[d], bv);
+                for k in 0..dim {
+                    w_all[d][k] -= c * bv[k];
+                }
+            }
+        }
+    }
+
+    let scale = (2.0 * kt * dt).sqrt();
+    let mut out = Vec::with_capacity(nvec);
+    for d in 0..nvec {
+        let m = alpha[d].len();
+        let half = if m == 0 {
+            vec![0.0f64; dim]
+        } else {
+            let mut t = vec![0.0f64; m * m];
+            for i in 0..m {
+                t[i * m + i] = alpha[d][i];
+                if i + 1 < m {
+                    t[i * m + (i + 1)] = beta[d][i];
+                    t[(i + 1) * m + i] = beta[d][i];
+                }
+            }
+            let (eig, q) = jacobi_eigh(&t, m);
+            let mut y = vec![0.0f64; m];
+            for (j, yj) in y.iter_mut().enumerate() {
+                let mut acc = 0.0;
+                for k in 0..m {
+                    acc += q[j * m + k] * eig[k].max(0.0).sqrt() * q[k];
+                }
+                *yj = acc;
+            }
+            let mut hv = vec![0.0f64; dim];
+            for (j, bv) in basis[d].iter().take(m).enumerate() {
+                let yj = beta0[d] * y[j];
+                for k in 0..dim {
+                    hv[k] += yj * bv[k];
+                }
+            }
+            hv
+        };
+        out.push(
+            (0..n)
+                .map(|i| {
+                    Vec3::new(
+                        scale * half[3 * i],
+                        scale * half[3 * i + 1],
+                        scale * half[3 * i + 2],
+                    )
+                })
+                .collect(),
+        );
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +524,60 @@ mod tests {
         }
         eprintln!("FD covariance max_rel={max_rel:.4}");
         assert!(max_rel < 0.03, "FD covariance off by {max_rel:.3}");
+    }
+
+    // Requires a CUDA GPU. cargo test --features gpu -- --ignored gpu_noise_fd_batched
+    // The batched draws make this the on-device FD pin: the single-draw GPU version
+    // took ~17 min for 300k matvecs, this runs 200k draws in well under a minute.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_noise_fd_batched_covariance() {
+        let ep = EwaldParams {
+            box_l: 10.0,
+            sigma: 2.5,
+            r_cut: 13.0,
+            k_max: 6,
+            a: 1.0,
+        };
+        let pos = vec![Vec3::new(3.0, 3.0, 3.0), Vec3::new(6.0, 3.0, 3.0)];
+        let n = pos.len();
+        let dim = 3 * n;
+        let (kt, dt) = (1.3_f64, 0.5_f64);
+        let m = periodic_grand_mobility(&pos, &ep);
+
+        let dev = GpuEwald::new().expect("cuda");
+        let mut rng = StdRng::seed_from_u64(20_240_605);
+        let batch = 1000usize;
+        let rounds = 200usize; // 200k draws total
+        let mut cov = vec![0.0f64; dim * dim];
+        for _ in 0..rounds {
+            let draws = brownian_noise_gpu_batched(&dev, &pos, &ep, kt, dt, dim, batch, &mut rng)
+                .expect("batched noise");
+            for dr in &draws {
+                let mut flat = vec![0.0f64; dim];
+                for i in 0..n {
+                    flat[3 * i] = dr[i].x;
+                    flat[3 * i + 1] = dr[i].y;
+                    flat[3 * i + 2] = dr[i].z;
+                }
+                for a in 0..dim {
+                    for b in 0..dim {
+                        cov[a * dim + b] += flat[a] * flat[b];
+                    }
+                }
+            }
+        }
+        let samples = (batch * rounds) as f64;
+        let mut max_rel = 0.0f64;
+        for a in 0..dim {
+            for b in 0..dim {
+                let est = cov[a * dim + b] / samples;
+                let target = 2.0 * kt * dt * m[a * dim + b];
+                let denom = (2.0 * kt * dt * m[a * dim + a]).max(1e-12);
+                max_rel = max_rel.max((est - target).abs() / denom);
+            }
+        }
+        eprintln!("batched FD covariance max_rel={max_rel:.4} over {samples} draws");
+        assert!(max_rel < 0.03, "batched FD covariance off by {max_rel:.3}");
     }
 }
