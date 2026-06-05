@@ -4,6 +4,7 @@
 //! other through one shared mobility matrix.
 
 pub mod mat3;
+pub mod mobility;
 pub mod rpy;
 
 use crate::vec3::Vec3;
