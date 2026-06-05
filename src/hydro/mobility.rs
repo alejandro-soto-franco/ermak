@@ -59,6 +59,31 @@ pub fn cholesky(m: &[f64], dim: usize) -> Result<Vec<f64>, usize> {
     Ok(l)
 }
 
+/// Apply the grand mobility to a per-particle force list, returning per-particle
+/// drift velocities `U_i = sum_j mu_ij F_j`.
+#[must_use]
+pub fn apply_mobility(m: &[f64], forces: &[crate::vec3::Vec3]) -> Vec<crate::vec3::Vec3> {
+    let n = forces.len();
+    let dim = 3 * n;
+    let mut f = vec![0.0f64; dim];
+    for (i, fi) in forces.iter().enumerate() {
+        f[3 * i] = fi.x;
+        f[3 * i + 1] = fi.y;
+        f[3 * i + 2] = fi.z;
+    }
+    let mut u = vec![crate::vec3::Vec3::ZERO; n];
+    for i in 0..n {
+        let (mut ux, mut uy, mut uz) = (0.0, 0.0, 0.0);
+        for j in 0..dim {
+            ux += m[(3 * i) * dim + j] * f[j];
+            uy += m[(3 * i + 1) * dim + j] * f[j];
+            uz += m[(3 * i + 2) * dim + j] * f[j];
+        }
+        u[i] = crate::vec3::Vec3::new(ux, uy, uz);
+    }
+    u
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +138,35 @@ mod tests {
                 assert!((s - m[i * dim + j]).abs() < 1e-9, "LL^T mismatch at {i},{j}");
             }
         }
+    }
+
+    #[test]
+    fn single_particle_drift_is_mu0_force() {
+        // One particle: U = mu0 F (no cross coupling).
+        let sys = HydroSystem {
+            pos: vec![Vec3::ZERO], radius: vec![2.0], charge: vec![0.0],
+            eta: 1.0, kt: 1.0, box_l: None,
+        };
+        let m = grand_mobility(&sys);
+        let f = vec![Vec3::new(0.0, 0.0, 3.0)];
+        let u = apply_mobility(&m, &f);
+        let mu0 = sys.self_mobility(0);
+        assert!((u[0].z - mu0 * 3.0).abs() < 1e-12, "U = mu0 F");
+        assert!(u[0].x.abs() < 1e-15 && u[0].y.abs() < 1e-15);
+    }
+
+    #[test]
+    fn equal_and_opposite_forces_drag_neighbour_along() {
+        // Two particles on x; push i in +x. HI drags j in +x too (entrainment):
+        // the xx cross-mobility is positive.
+        let sys = HydroSystem {
+            pos: vec![Vec3::ZERO, Vec3::new(5.0, 0.0, 0.0)], radius: vec![1.0, 1.0],
+            charge: vec![0.0, 0.0], eta: 1.0, kt: 1.0, box_l: None,
+        };
+        let m = grand_mobility(&sys);
+        let f = vec![Vec3::new(1.0, 0.0, 0.0), Vec3::ZERO];
+        let u = apply_mobility(&m, &f);
+        assert!(u[1].x > 0.0, "neighbour entrained in +x, got {}", u[1].x);
+        assert!(u[0].x > u[1].x, "driven particle faster than entrained one");
     }
 }
