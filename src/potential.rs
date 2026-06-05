@@ -175,13 +175,19 @@ mod tests {
         );
         // deeper well -> stronger (more negative) binding, monotonically
         let depths = [0.0, 1.0, 2.0, 4.0, 8.0];
-        let gs: Vec<f64> = depths.iter().map(|&e| binding_free_energy(r_b, e, kt, v0, n)).collect();
+        let gs: Vec<f64> = depths
+            .iter()
+            .map(|&e| binding_free_energy(r_b, e, kt, v0, n))
+            .collect();
         for w in gs.windows(2) {
             assert!(w[1] < w[0], "dG must decrease with well depth: {:?}", gs);
         }
         // deep-well limit: dG ~ -well_depth + const
         let deep = binding_free_energy(r_b, 12.0, kt, v0, n);
-        assert!(deep < -10.0, "deep well should give strong binding, got {deep}");
+        assert!(
+            deep < -10.0,
+            "deep well should give strong binding, got {deep}"
+        );
     }
 
     #[test]
