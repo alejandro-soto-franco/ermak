@@ -59,8 +59,7 @@ jobs:
         run: pip install maturin pytest
 
       - name: build ermak-py
-        working-directory: ermak-py
-        run: maturin develop
+        run: pip install ./ermak-py --no-build-isolation
 
       - name: pytest
         run: pytest ermak-py/tests -v
