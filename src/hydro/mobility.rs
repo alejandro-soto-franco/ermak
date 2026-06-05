@@ -2,7 +2,7 @@
 //! the CPU oracle's linear algebra. O((3N)^3); reference-scale only.
 
 use crate::hydro::HydroSystem;
-use crate::hydro::rpy::rpy_pair_equal;
+use crate::hydro::rpy::rpyw_pair;
 
 /// Assemble the dense `3N x 3N` grand mobility (open boundary, equal radius
 /// taken as `radius[0]` for this milestone; Task A8 generalizes per-particle).
@@ -11,7 +11,6 @@ use crate::hydro::rpy::rpy_pair_equal;
 pub fn grand_mobility(sys: &HydroSystem) -> Vec<f64> {
     let n = sys.n();
     let dim = 3 * n;
-    let a = sys.radius[0];
     let mut m = vec![0.0f64; dim * dim];
     for i in 0..n {
         // diagonal self block mu0_i I
@@ -20,7 +19,7 @@ pub fn grand_mobility(sys: &HydroSystem) -> Vec<f64> {
             m[(3 * i + d) * dim + (3 * i + d)] = mu0;
         }
         for j in (i + 1)..n {
-            let block = rpy_pair_equal(sys.pos[i] - sys.pos[j], a, sys.eta);
+            let block = rpyw_pair(sys.pos[i] - sys.pos[j], sys.radius[i], sys.radius[j], sys.eta);
             for r in 0..3 {
                 for c in 0..3 {
                     let v = block.0[3 * r + c];
@@ -168,5 +167,16 @@ mod tests {
         let u = apply_mobility(&m, &f);
         assert!(u[1].x > 0.0, "neighbour entrained in +x, got {}", u[1].x);
         assert!(u[0].x > u[1].x, "driven particle faster than entrained one");
+    }
+
+    #[test]
+    fn polydisperse_mobility_is_spd() {
+        let mut rng = StdRng::seed_from_u64(99);
+        let n = 8;
+        let pos = (0..n).map(|_| Vec3::new(rng.gen_range(0.0..15.0), rng.gen_range(0.0..15.0), rng.gen_range(0.0..15.0))).collect();
+        let radius = (0..n).map(|_| rng.gen_range(0.5..2.5)).collect();
+        let sys = HydroSystem { pos, radius, charge: vec![0.0; n], eta: 1.0, kt: 1.0, box_l: None };
+        let m = grand_mobility(&sys);
+        assert!(cholesky(&m, 3 * n).is_ok(), "polydisperse mobility not SPD");
     }
 }
