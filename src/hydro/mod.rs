@@ -3,8 +3,11 @@
 //! independent single-tracer walkers, every particle here couples to every
 //! other through one shared mobility matrix.
 
-// pub mod ewald;  // WIP (Milestone B): Beenakker-Ewald coefficients fail the
-// alpha-invariance gate; needs the exact reference formulas before wiring in.
+// Milestone B (periodic Beenakker-Ewald) is WIP and NOT wired in: the real-space
+// tensor + reciprocal Oseen/RPY form are correct (alpha-invariance improved 60x to
+// ~2.5e-3), but the a^2-correction's separate Ewald split needs the exact primary
+// coefficients to pass the 5e-4 gate. Scaffold preserved in ermak-planning. The
+// periodic path is properly Plan 2's domain (Fiore-Swan PSE on GPU).
 pub mod mat3;
 pub mod mobility;
 pub mod noise;
