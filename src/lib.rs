@@ -7,6 +7,7 @@ pub mod diffusion;
 pub mod error;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod hydro;
 pub mod integrator;
 pub mod kinetics;
 pub mod memory;
