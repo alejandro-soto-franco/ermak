@@ -5,6 +5,7 @@
 
 pub mod mat3;
 pub mod mobility;
+pub mod noise;
 pub mod rpy;
 
 use crate::vec3::Vec3;
