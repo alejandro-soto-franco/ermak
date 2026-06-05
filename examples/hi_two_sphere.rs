@@ -28,7 +28,9 @@ fn main() {
     let mu0 = 1.0 / (6.0 * std::f64::consts::PI * eta * a);
 
     println!("# two-sphere RPY hydrodynamic signature (mu0 units), a = {a}");
-    println!("# d/a  par_engine  par_analytic  perp_engine  perp_analytic  Drel_par/2D0(HI)  Drel_par/2D0(free)  regime");
+    println!(
+        "# d/a  par_engine  par_analytic  perp_engine  perp_analytic  Drel_par/2D0(HI)  Drel_par/2D0(free)  regime"
+    );
     for &doa in &[2.0_f64, 2.5, 3.0, 4.0, 6.0, 10.0] {
         let d = doa * a;
         let block = rpy_pair_equal(Vec3::new(d, 0.0, 0.0), a, eta);
@@ -39,7 +41,11 @@ fn main() {
         let perp_an = 0.75 * a / d + 0.5 * a.powi(3) / d.powi(3);
         let drel_hi = 1.0 - par; // relative approach diffusion, normalized
         let drel_free = 1.0; // free-draining: no coupling
-        let regime = if doa < 2.5 { "near-contact: RPY misses lubrication" } else { "far-field: RPY reliable" };
+        let regime = if doa < 2.5 {
+            "near-contact: RPY misses lubrication"
+        } else {
+            "far-field: RPY reliable"
+        };
         println!(
             "{doa:4.1}  {par:10.5}  {par_an:12.5}  {perp:11.5}  {perp_an:13.5}  {drel_hi:16.5}  {drel_free:18.5}  {regime}"
         );

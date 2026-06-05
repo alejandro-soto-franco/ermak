@@ -19,9 +19,9 @@
 use ermak::hydro::HydroSystem;
 use ermak::hydro::mobility::{cholesky, grand_mobility};
 use ermak::vec3::Vec3;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::Rng;
 
 /// Solve L L^T x = b (lower-Cholesky factor L, dim x dim, row-major).
 fn chol_solve(l: &[f64], dim: usize, b: &[f64]) -> Vec<f64> {
@@ -76,7 +76,11 @@ fn ds_over_d0(n_obst: usize, phi: f64, seed: u64) -> f64 {
     let mut tries = 0;
     while pos.len() < n_obst + 1 && tries < 200_000 {
         tries += 1;
-        let p = Vec3::new(rng.gen_range(0.0..l), rng.gen_range(0.0..l), rng.gen_range(0.0..l));
+        let p = Vec3::new(
+            rng.gen_range(0.0..l),
+            rng.gen_range(0.0..l),
+            rng.gen_range(0.0..l),
+        );
         // keep a small surface gap (2.1a centre-centre) so RPY stays near-field-clean
         if pos.iter().all(|q| (p - *q).norm2().sqrt() > 2.1 * a) {
             pos.push(p);
@@ -84,7 +88,14 @@ fn ds_over_d0(n_obst: usize, phi: f64, seed: u64) -> f64 {
     }
     let n = pos.len();
     let dim = 3 * n;
-    let sys = HydroSystem { pos, radius: vec![a; n], charge: vec![0.0; n], eta, kt: 1.0, box_l: None };
+    let sys = HydroSystem {
+        pos,
+        radius: vec![a; n],
+        charge: vec![0.0; n],
+        eta,
+        kt: 1.0,
+        box_l: None,
+    };
     let m = grand_mobility(&sys);
     let l_chol = cholesky(&m, dim).expect("SPD");
     // (M^-1)_tt: solve M x = e_d for d in 0..3, take the top 3 rows

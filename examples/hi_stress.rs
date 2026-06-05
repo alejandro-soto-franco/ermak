@@ -8,17 +8,30 @@
 use ermak::hydro::HydroSystem;
 use ermak::hydro::mobility::{cholesky, grand_mobility};
 use ermak::vec3::Vec3;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::Rng;
 use std::time::Instant;
 
 fn random_box(n: usize, box_l: f64, seed: u64) -> HydroSystem {
     let mut rng = StdRng::seed_from_u64(seed);
     let pos = (0..n)
-        .map(|_| Vec3::new(rng.gen_range(0.0..box_l), rng.gen_range(0.0..box_l), rng.gen_range(0.0..box_l)))
+        .map(|_| {
+            Vec3::new(
+                rng.gen_range(0.0..box_l),
+                rng.gen_range(0.0..box_l),
+                rng.gen_range(0.0..box_l),
+            )
+        })
         .collect();
-    HydroSystem { pos, radius: vec![1.0; n], charge: vec![0.0; n], eta: 1.0, kt: 1.0, box_l: None }
+    HydroSystem {
+        pos,
+        radius: vec![1.0; n],
+        charge: vec![0.0; n],
+        eta: 1.0,
+        kt: 1.0,
+        box_l: None,
+    }
 }
 
 fn main() {
