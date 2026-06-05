@@ -110,6 +110,34 @@ pub fn binding_free_energy(r_b: f64, well_depth: f64, kt: f64, v0: f64, n: usize
     -kt * (z / v0).ln()
 }
 
+// ---------------------------------------------------------------------------
+// Screened-Coulomb (Yukawa / Debye-Huckel) interaction
+// ---------------------------------------------------------------------------
+
+/// Screened-Coulomb pair energy. `k_e = 1/(4 pi eps)`, `kappa = 1 / lambda_D`
+/// (inverse Debye length). Zero beyond `cutoff`.
+#[must_use]
+pub fn yukawa_energy(r: f64, qi: f64, qj: f64, k_e: f64, kappa: f64, cutoff: f64) -> f64 {
+    if r >= cutoff || r <= 0.0 {
+        return 0.0;
+    }
+    k_e * qi * qj * (-kappa * r).exp() / r
+}
+
+/// Screened-Coulomb force on `i` from `j`, `rij = r_i - r_j`. Points along `rij`
+/// for like charges (repulsive). Zero beyond `cutoff`.
+#[must_use]
+pub fn yukawa_pair_force(rij: Vec3, qi: f64, qj: f64, k_e: f64, kappa: f64, cutoff: f64) -> Vec3 {
+    let r2 = rij.norm2();
+    if r2 >= cutoff * cutoff || r2 <= 0.0 {
+        return Vec3::ZERO;
+    }
+    let r = r2.sqrt();
+    // |F| = -dU/dr = k_e qi qj exp(-kappa r) (kappa r + 1) / r^2, along rij/r.
+    let mag = k_e * qi * qj * (-kappa * r).exp() * (kappa * r + 1.0) / r2;
+    rij.scale(mag / r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +249,34 @@ mod tests {
             "force at bottleneck top should vanish, got {}",
             at_rb.x
         );
+    }
+
+    #[test]
+    fn yukawa_force_matches_negative_gradient() {
+        let (qi, qj, k_e, kappa, cutoff) = (1.0, 1.0, 2.0, 0.5, 20.0);
+        let r = 1.7;
+        let h = 1e-6;
+        let dudr = (yukawa_energy(r + h, qi, qj, k_e, kappa, cutoff)
+            - yukawa_energy(r - h, qi, qj, k_e, kappa, cutoff)) / (2.0 * h);
+        let f = yukawa_pair_force(Vec3::new(r, 0.0, 0.0), qi, qj, k_e, kappa, cutoff);
+        assert!((f.x - (-dudr)).abs() < 1e-5, "F_x={} vs -dU/dr={}", f.x, -dudr);
+    }
+
+    #[test]
+    fn yukawa_like_charges_repel_unlike_attract() {
+        let v = Vec3::new(2.0, 0.0, 0.0);
+        let rep = yukawa_pair_force(v, 1.0, 1.0, 1.0, 0.3, 20.0);
+        let att = yukawa_pair_force(v, 1.0, -1.0, 1.0, 0.3, 20.0);
+        assert!(rep.x > 0.0, "like charges repel (+x)");
+        assert!(att.x < 0.0, "unlike charges attract (-x)");
+    }
+
+    #[test]
+    fn yukawa_screening_shortens_range() {
+        // Stronger screening (larger kappa) gives a weaker force at fixed r.
+        let v = Vec3::new(3.0, 0.0, 0.0);
+        let weak = yukawa_pair_force(v, 1.0, 1.0, 1.0, 0.1, 50.0).x;
+        let strong = yukawa_pair_force(v, 1.0, 1.0, 1.0, 1.0, 50.0).x;
+        assert!(strong < weak, "more screening -> weaker force: {strong} vs {weak}");
     }
 }
