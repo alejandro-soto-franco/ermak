@@ -8,6 +8,8 @@ pub mod ewald;
 pub mod gpu_ewald;
 #[cfg(feature = "gpu")]
 pub mod gpu_noise;
+#[cfg(feature = "gpu")]
+pub mod gpu_step;
 pub mod mat3;
 pub mod mobility;
 pub mod noise;
