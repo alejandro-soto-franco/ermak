@@ -408,6 +408,66 @@ mod tests {
             .fold(0.0, f64::max)
     }
 
+    /// The GRPerY/Beenakker reciprocal split used for the drift is NOT
+    /// positive-definite as a stand-alone wave operator, so it admits no real
+    /// square root: a single-FFT positive-split wave NOISE (sqrt of the wave Green
+    /// factor on the k-grid) is impossible with this kernel, and the wave noise
+    /// must instead come from a Lanczos sqrt of the full SPD mobility (which IS
+    /// what `gpu_pse_wave::brownian_noise_pse` does). The obstruction is twofold:
+    /// the per-mode Green tensor `I - B(k) k_hat k_hat` has the negative eigenvalue
+    /// `1 - B(k) < 0` along k_hat (since `B = 1 + sigma^2 k^2 / 2 > 1`), and the
+    /// assembled reciprocal-only grand mobility fails a Cholesky. A genuinely
+    /// positive split needs the sinc^2 / Hasimoto RPY kernel (a consistent
+    /// drift-and-noise redesign), tracked as a follow-up.
+    #[test]
+    fn grpery_wave_split_is_indefinite() {
+        use crate::hydro::mobility::cholesky;
+        let l = 10.0;
+        let ep = EwaldParams {
+            box_l: l,
+            sigma: 2.5,
+            r_cut: 13.0,
+            k_max: 12,
+            a: 1.0,
+        };
+        // per-mode obstruction: 1 - B(k) < 0 for any k != 0.
+        let k = 2.0;
+        let b = 1.0 + ep.sigma * ep.sigma * k * k / 2.0;
+        assert!(
+            1.0 - b < 0.0,
+            "wave tensor must have a negative along-k eigenvalue; 1 - B = {}",
+            1.0 - b
+        );
+
+        // operator obstruction: the reciprocal-only grand mobility is not SPD.
+        let pos = random_box(4, l, 7);
+        let n = pos.len();
+        let dim = 3 * n;
+        let mut m = vec![0.0f64; dim * dim];
+        let diag = recip_space_block(Vec3::ZERO, &ep);
+        for i in 0..n {
+            for r in 0..3 {
+                for c in 0..3 {
+                    m[(3 * i + r) * dim + (3 * i + c)] = diag.0[3 * r + c];
+                }
+            }
+            for j in (i + 1)..n {
+                let blk = recip_space_block(pos[i] - pos[j], &ep);
+                for r in 0..3 {
+                    for c in 0..3 {
+                        let v = blk.0[3 * r + c];
+                        m[(3 * i + r) * dim + (3 * j + c)] = v;
+                        m[(3 * j + c) * dim + (3 * i + r)] = v;
+                    }
+                }
+            }
+        }
+        assert!(
+            cholesky(&m, dim).is_err(),
+            "the GRPerY reciprocal-only grand mobility is expected to be indefinite"
+        );
+    }
+
     #[test]
     fn pse_converges_to_dense_reciprocal() {
         let l = 10.0;
