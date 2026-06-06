@@ -11,6 +11,8 @@ pub mod gpu_fft;
 #[cfg(feature = "gpu")]
 pub mod gpu_noise;
 #[cfg(feature = "gpu")]
+pub mod gpu_pse_wave;
+#[cfg(feature = "gpu")]
 pub mod gpu_step;
 pub mod mat3;
 pub mod mobility;
