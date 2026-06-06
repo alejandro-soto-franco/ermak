@@ -14,6 +14,7 @@
 //! device path.
 
 use crate::error::ErmakError;
+use crate::hydro::ewald::EwaldParams;
 use crate::hydro::gpu_fft::Fft3d;
 use crate::hydro::pse_wave::WaveParams;
 use crate::vec3::Vec3;
@@ -162,6 +163,91 @@ extern "C" __global__ void pse_gather(
     u[3*i+1] = uy * h3;
     u[3*i+2] = uz * h3;
 }
+
+// Real-space (short-range) part of the periodic RPY mobility apply: the
+// erfc-screened bare RPY plus GRPerY Gaussian polynomial lattice sum, the self
+// scalar terms (mu0 + analytic n=0 replacement) on the diagonal block, and the
+// k=0 backflow on every block. This is `ewald_apply` of `gpu_ewald` with the
+// reciprocal loop removed; the FFT wave path supplies the reciprocal half, so
+// `pse_real + wave = full periodic mobility`.
+__device__ __forceinline__ double erfc_as(double x) {
+    double z = fabs(x);
+    double t = 1.0 / (1.0 + 0.3275911 * z);
+    double y = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+        - 0.284496736) * t + 0.254829592) * t * exp(-z * z);
+    return x >= 0.0 ? y : 2.0 - y;
+}
+
+extern "C" __global__ void pse_real(
+    double *u, const double *pos, const double *force, int n,
+    double box_l, double sigma, double r_cut, double a)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const double PI = 3.14159265358979323846;
+    const double s = sigma;
+    const double s2 = s * s;
+    const double a2 = a * a;
+    const double vol = box_l * box_l * box_l;
+    const double two_a2 = 2.0 * a2;
+    const double p23a2 = two_a2 / 3.0;
+    const double sqrt2 = 1.41421356237309504880;
+    const double sqrt2pi = 2.50662827463100050242;
+    const double backflow = -(s2 * PI / (2.0 * vol));
+    const double mu0 = 1.0 / (6.0 * a);
+    const double self_analytic = (a2 / (9.0 * s2) - 1.0) / (4.0 * sqrt2pi * s);
+    int span = (int)ceil(r_cut / box_l) + 1;
+
+    double xi = pos[3*i+0], yi = pos[3*i+1], zi = pos[3*i+2];
+    double ux = 0.0, uy = 0.0, uz = 0.0;
+
+    for (int j = 0; j < n; j++) {
+        int is_self = (j == i);
+        double rijx = xi - pos[3*j+0];
+        double rijy = yi - pos[3*j+1];
+        double rijz = zi - pos[3*j+2];
+        double m00=0,m01=0,m02=0,m10=0,m11=0,m12=0,m20=0,m21=0,m22=0;
+
+        for (int nx = -span; nx <= span; nx++)
+        for (int ny = -span; ny <= span; ny++)
+        for (int nz = -span; nz <= span; nz++) {
+            if (is_self && nx==0 && ny==0 && nz==0) continue;
+            double dx = rijx + nx * box_l;
+            double dy = rijy + ny * box_l;
+            double dz = rijz + nz * box_l;
+            double r2 = dx*dx + dy*dy + dz*dz;
+            double r = sqrt(r2);
+            if (r > r_cut || r == 0.0) continue;
+            double r3 = r2 * r;
+            double ex = dx / r, ey = dy / r, ez = dz / r;
+            double ec = erfc_as(r / (s * sqrt2));
+            double id_coef = (1.0/r + p23a2/r3) / 8.0 * ec;
+            double rr_coef = (1.0/r - 3.0*p23a2/r3) / 8.0 * ec;
+            double p_i = two_a2 * (1.0/(6.0*s2) + 1.0/(3.0*r2));
+            double p_rr = two_a2 * (r2/(6.0*s2*s2) - 1.0/(3.0*s2) - 1.0/r2) + 1.0;
+            double pre = exp(-r2/(2.0*s2)) / (4.0 * sqrt2pi * s);
+            double id_part = id_coef + p_i * pre;
+            double rr_part = rr_coef + p_rr * pre;
+            m00 += id_part + rr_part*ex*ex; m01 += rr_part*ex*ey; m02 += rr_part*ex*ez;
+            m10 += rr_part*ey*ex; m11 += id_part + rr_part*ey*ey; m12 += rr_part*ey*ez;
+            m20 += rr_part*ez*ex; m21 += rr_part*ez*ey; m22 += id_part + rr_part*ez*ez;
+        }
+
+        if (is_self) {
+            double d = mu0 + self_analytic + backflow;
+            m00 += d; m11 += d; m22 += d;
+        } else {
+            m00 += backflow; m11 += backflow; m22 += backflow;
+        }
+
+        double fx = force[3*j+0], fy = force[3*j+1], fz = force[3*j+2];
+        ux += m00*fx + m01*fy + m02*fz;
+        uy += m10*fx + m11*fy + m12*fz;
+        uz += m20*fx + m21*fy + m22*fz;
+    }
+    u[3*i+0] = ux; u[3*i+1] = uy; u[3*i+2] = uz;
+}
 "#;
 
 /// GPU Spectral-Ewald reciprocal mobility. Holds the context, stream, and the
@@ -172,6 +258,7 @@ pub struct GpuPseWave {
     spread: CudaFunction,
     scale: CudaFunction,
     gather: CudaFunction,
+    real: CudaFunction,
 }
 
 impl GpuPseWave {
@@ -189,12 +276,14 @@ impl GpuPseWave {
         let spread = module.load_function("pse_spread").map_err(driver_err)?;
         let scale = module.load_function("pse_scale").map_err(driver_err)?;
         let gather = module.load_function("pse_gather").map_err(driver_err)?;
+        let real = module.load_function("pse_real").map_err(driver_err)?;
         Ok(Self {
             _ctx: ctx,
             stream,
             spread,
             scale,
             gather,
+            real,
         })
     }
 
@@ -366,6 +455,79 @@ impl GpuPseWave {
             .map(|i| Vec3::new(out[3 * i], out[3 * i + 1], out[3 * i + 2]))
             .collect())
     }
+
+    /// Real-space (short-range) part of the periodic mobility apply on the device:
+    /// the erfc-screened RPY lattice sum plus the self scalar and k=0 backflow
+    /// terms (the `pse_real` kernel). `ep.k_max` is unused here.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any driver error.
+    pub fn real_apply_gpu(
+        &self,
+        pos: &[Vec3],
+        forces: &[Vec3],
+        ep: &EwaldParams,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        let n = pos.len();
+        assert_eq!(forces.len(), n, "forces and positions length mismatch");
+        let host_pos: Vec<f64> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+        let host_f: Vec<f64> = forces.iter().flat_map(|f| [f.x, f.y, f.z]).collect();
+        let d_pos = self.stream.clone_htod(&host_pos).map_err(driver_err)?;
+        let d_f = self.stream.clone_htod(&host_f).map_err(driver_err)?;
+        let mut d_u = self.stream.alloc_zeros::<f64>(3 * n).map_err(driver_err)?;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let n_i = n as i32;
+        let (box_l, sigma, r_cut, a) = (ep.box_l, ep.sigma, ep.r_cut, ep.a);
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let n_u = n as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_u.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = self.stream.launch_builder(&self.real);
+        b.arg(&mut d_u);
+        b.arg(&d_pos);
+        b.arg(&d_f);
+        b.arg(&n_i);
+        b.arg(&box_l);
+        b.arg(&sigma);
+        b.arg(&r_cut);
+        b.arg(&a);
+        unsafe { b.launch(cfg) }.map_err(driver_err)?;
+
+        let out = self.stream.clone_dtoh(&d_u).map_err(driver_err)?;
+        Ok((0..n)
+            .map(|i| Vec3::new(out[3 * i], out[3 * i + 1], out[3 * i + 2]))
+            .collect())
+    }
+
+    /// Full periodic RPY mobility apply on the device via Positively-Split Ewald:
+    /// real-space part (`pse_real`) plus the FFT wave-space part
+    /// ([`Self::recip_apply_pse_gpu`]) sum to the full grand mobility
+    /// `U_i = sum_j M_ij F_j` of [`crate::hydro::ewald::periodic_grand_mobility`].
+    /// The reciprocal half is the O(N log N) particle-mesh solve rather than the
+    /// dense O(N^2 k_max^3) lattice sum. `ng` is the cubic wave-grid size.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any driver or cuFFT error.
+    pub fn full_apply(
+        &self,
+        pos: &[Vec3],
+        forces: &[Vec3],
+        ep: &EwaldParams,
+        ng: usize,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        let u_real = self.real_apply_gpu(pos, forces, ep)?;
+        let wp = WaveParams::new(ep.box_l, ep.sigma, ep.a, ng);
+        let u_wave = self.recip_apply_pse_gpu(pos, forces, &wp)?;
+        Ok(u_real
+            .iter()
+            .zip(u_wave.iter())
+            .map(|(r, w)| *r + *w)
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -468,6 +630,34 @@ mod tests {
         assert!(
             err < 1e-10,
             "GPU PSE must match the CPU reference; {err:.3e}"
+        );
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_full_matches_dense --nocapture
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_full_matches_dense_mobility() {
+        use crate::hydro::ewald::periodic_grand_mobility;
+        use crate::hydro::mobility::apply_mobility;
+        let (l, sigma, a, pos, forces) = setup();
+        let ep = EwaldParams {
+            box_l: l,
+            sigma,
+            r_cut: 13.0,
+            k_max: 12,
+            a,
+        };
+        // Dense oracle: full periodic grand mobility apply.
+        let m = periodic_grand_mobility(&pos, &ep);
+        let u_dense = apply_mobility(&m, &forces);
+
+        let dev = GpuPseWave::new().expect("cuda");
+        let u_pse = dev.full_apply(&pos, &forces, &ep, 32).expect("full apply");
+        let err = max_abs(&u_dense, &u_pse);
+        eprintln!("gpu-pse-full-vs-dense mobility: max_abs={err:.3e}");
+        assert!(
+            err < 1e-4,
+            "PSE (real + FFT wave) must match the dense periodic mobility; {err:.3e}"
         );
     }
 
