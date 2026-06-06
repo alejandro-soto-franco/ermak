@@ -12,6 +12,7 @@ use crate::hydro::ewald::{EwaldParams, periodic_grand_mobility};
 use crate::hydro::gpu_ewald::GpuEwald;
 use crate::hydro::gpu_noise::brownian_noise_gpu;
 use crate::hydro::gpu_pse_wave::GpuPseWave;
+use crate::hydro::pse_wave::WaveParams;
 use crate::potential::{wca_pair_force, yukawa_pair_force};
 use crate::vec3::Vec3;
 use rand::Rng;
@@ -208,6 +209,55 @@ pub fn em_step_hi_pse_sinc_gpu<R: Rng + ?Sized>(
     Ok(())
 }
 
+/// Truncated-support O(N log N) variant of [`em_step_hi_pse_sinc_gpu`]: the wave
+/// drift and the wave noise both use a compact `(2*support+1)^3` spreading window
+/// (spread width `spread_eta = h = box_l/ng`) instead of the full grid, so the
+/// per-particle wave cost is independent of `ng`. The truncation error is the
+/// aliasing (`~exp(-2 pi^2 (spread_eta/h)^2)`) plus the window cutoff
+/// (`~exp(-support^2/2)`); `support` around 5 to 8 is below double precision for
+/// the screened sinc^2 kernel. The short-range real part is already O(N).
+///
+/// # Errors
+/// [`ErmakError::Gpu`] on any device or cuFFT error.
+#[allow(clippy::too_many_arguments)]
+pub fn em_step_hi_pse_sinc_trunc_gpu<R: Rng + ?Sized>(
+    dev: &GpuPseWave,
+    pos: &mut [Vec3],
+    charge: &[f64],
+    ep: &EwaldParams,
+    fp: ForceParams,
+    eta: f64,
+    kt: f64,
+    dt: f64,
+    ng: usize,
+    support: usize,
+    m_iters: usize,
+    rng: &mut R,
+) -> Result<(), ErmakError> {
+    let n = pos.len();
+    let inv_pi_eta = 1.0 / (PI * eta);
+    #[allow(clippy::cast_precision_loss)]
+    let h = ep.box_l / ng as f64;
+    // Truncated Spectral-Ewald window: small spread width (~one cell) and a compact
+    // support; eta cancels analytically so the net wave filter is unchanged.
+    let wp = WaveParams::truncated(ep.box_l, ep.sigma, ep.a, ng, h, support);
+    let forces = periodic_pair_forces(pos, charge, ep.box_l, fp);
+
+    let d_grpery = dev.full_apply_sinc_wp(pos, &forces, ep, &wp)?;
+    let drift: Vec<Vec3> = d_grpery.iter().map(|u| u.scale(inv_pi_eta)).collect();
+    let noise = dev.brownian_noise_sinc_wp(pos, ep, &wp, kt * inv_pi_eta, dt, m_iters, rng)?;
+
+    for i in 0..n {
+        pos[i] += drift[i].scale(dt) + noise[i];
+        pos[i] = Vec3::new(
+            wrap(pos[i].x, ep.box_l),
+            wrap(pos[i].y, ep.box_l),
+            wrap(pos[i].z, ep.box_l),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +440,55 @@ mod tests {
         assert!(
             max_abs < 1e-12,
             "sinc^2 PSE drift step must equal M_phys F dt; {max_abs:.3e}"
+        );
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_sinc_trunc_step_drift --nocapture
+    // The truncated O(N log N) sinc^2 step at kT=0 advances by exactly the
+    // truncated-window drift M_phys F dt (bit-exact vs full_apply_sinc_wp on the
+    // same truncated WaveParams).
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_sinc_trunc_step_drift_matches_apply() {
+        use crate::hydro::gpu_pse_wave::GpuPseWave;
+        let ep = ep10();
+        let eta = 0.31;
+        let inv_pi_eta = 1.0 / (PI * eta);
+        let dt = 0.001;
+        let ng = 32usize;
+        let support = 6usize;
+        let h = ep.box_l / ng as f64;
+        let wp = WaveParams::truncated(ep.box_l, ep.sigma, ep.a, ng, h, support);
+        let mut pos = vec![Vec3::new(4.0, 5.0, 5.0), Vec3::new(5.2, 5.0, 5.0)];
+        let charge = vec![0.0, 0.0];
+        let start = pos.clone();
+        let forces = periodic_pair_forces(&pos, &charge, ep.box_l, FP);
+
+        let dev = GpuPseWave::new().expect("cuda");
+        let u = dev
+            .full_apply_sinc_wp(&pos, &forces, &ep, &wp)
+            .expect("full_apply_sinc_wp");
+        let mut rng = StdRng::seed_from_u64(1);
+        em_step_hi_pse_sinc_trunc_gpu(
+            &dev, &mut pos, &charge, &ep, FP, eta, 0.0, dt, ng, support, 6, &mut rng,
+        )
+        .expect("pse sinc trunc step");
+
+        let mut max_abs = 0.0f64;
+        for i in 0..pos.len() {
+            let expect = start[i] + u[i].scale(inv_pi_eta * dt);
+            for (a, b) in [
+                (pos[i].x, expect.x),
+                (pos[i].y, expect.y),
+                (pos[i].z, expect.z),
+            ] {
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        eprintln!("pse sinc trunc step-drift vs full_apply_sinc_wp: max_abs={max_abs:.3e}");
+        assert!(
+            max_abs < 1e-12,
+            "truncated sinc^2 drift step must equal M_phys F dt; {max_abs:.3e}"
         );
     }
 

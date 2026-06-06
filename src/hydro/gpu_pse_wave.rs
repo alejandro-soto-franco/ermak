@@ -983,9 +983,24 @@ impl GpuPseWave {
         ep: &EwaldParams,
         ng: usize,
     ) -> Result<Vec<Vec3>, ErmakError> {
-        let u_real = self.real_apply_sinc_gpu(pos, forces, ep)?;
         let wp = WaveParams::new(ep.box_l, ep.sigma, ep.a, ng);
-        let u_wave = self.recip_apply_pse_sinc_gpu(pos, forces, &wp)?;
+        self.full_apply_sinc_wp(pos, forces, ep, &wp)
+    }
+
+    /// As [`Self::full_apply_sinc`] but with an explicit [`WaveParams`]: a truncated
+    /// window gives the O(N P^3) wave drift (the real part is already short-range).
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any device or cuFFT error.
+    pub fn full_apply_sinc_wp(
+        &self,
+        pos: &[Vec3],
+        forces: &[Vec3],
+        ep: &EwaldParams,
+        wp: &WaveParams,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        let u_real = self.real_apply_sinc_gpu(pos, forces, ep)?;
+        let u_wave = self.recip_apply_pse_sinc_gpu(pos, forces, wp)?;
         Ok(u_real
             .iter()
             .zip(u_wave.iter())
@@ -1093,17 +1108,43 @@ impl GpuPseWave {
         dt: f64,
         rng: &mut R,
     ) -> Result<Vec<Vec3>, ErmakError> {
+        let wp = WaveParams::new(ep.box_l, ep.sigma, ep.a, ng);
+        self.brownian_wave_noise_sinc_wp(pos, ep, &wp, kt, dt, rng)
+    }
+
+    /// As [`Self::brownian_wave_noise_sinc`] but with an explicit [`WaveParams`], so
+    /// a truncated-support window (`WaveParams::truncated`) gives the O(N P^3)
+    /// single-FFT wave noise (gather only the `(2*support+1)^3` nearest nodes). The
+    /// covariance is `2 kT dt M^(w)_trunc`, which converges to `M^(w)` with the
+    /// support (the same window as the deterministic truncated apply, so the noise
+    /// and drift use the same operator).
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any device or cuFFT error.
+    pub fn brownian_wave_noise_sinc_wp<R: Rng + ?Sized>(
+        &self,
+        pos: &[Vec3],
+        ep: &EwaldParams,
+        wp: &WaveParams,
+        kt: f64,
+        dt: f64,
+        rng: &mut R,
+    ) -> Result<Vec<Vec3>, ErmakError> {
         let n = pos.len();
+        let ng = wp.ng;
         let ng3 = ng * ng * ng;
         let l = ep.box_l;
         #[allow(clippy::cast_precision_loss)]
         let h = l / ng as f64;
         let h3 = h * h * h;
-        let eta = 0.5 * ep.sigma; // full-grid default (matches WaveParams::new)
+        let eta = wp.eta;
         let s = ep.sigma;
         let a = ep.a;
         let vol = l * l * l;
         let two_pi_l = 2.0 * std::f64::consts::PI / l;
+        let truncated = wp.is_truncated();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let support_i = wp.support as i32;
 
         // Complex white noise on the k-grid: Re, Im ~ N(0,1) so <a a^H> = 2 I.
         let normal = Normal::new(0.0, 1.0).expect("unit normal");
@@ -1188,20 +1229,37 @@ impl GpuPseWave {
         fft.inverse(&mut sc.vky, &mut sc.vgy)?;
         fft.inverse(&mut sc.vkz, &mut sc.vgz)?;
 
-        // gather the real grid component (= Re of the inverse FFT) to particles
-        let mut b = self.stream.launch_builder(&self.gather);
-        b.arg(&mut sc.d_u);
-        b.arg(&sc.vgx);
-        b.arg(&sc.vgy);
-        b.arg(&sc.vgz);
-        b.arg(&sc.d_pos);
-        b.arg(&n_i);
-        b.arg(&ng_i);
-        b.arg(&h);
-        b.arg(&h3);
-        b.arg(&eta);
-        b.arg(&l);
-        unsafe { b.launch(particle_cfg) }.map_err(driver_err)?;
+        // gather the real grid component (= Re of the inverse FFT) to particles;
+        // truncated path reads only the (2*support+1)^3 window per particle.
+        if truncated {
+            let mut b = self.stream.launch_builder(&self.gather_trunc);
+            b.arg(&mut sc.d_u);
+            b.arg(&sc.vgx);
+            b.arg(&sc.vgy);
+            b.arg(&sc.vgz);
+            b.arg(&sc.d_pos);
+            b.arg(&n_i);
+            b.arg(&ng_i);
+            b.arg(&support_i);
+            b.arg(&h);
+            b.arg(&h3);
+            b.arg(&eta);
+            unsafe { b.launch(particle_cfg) }.map_err(driver_err)?;
+        } else {
+            let mut b = self.stream.launch_builder(&self.gather);
+            b.arg(&mut sc.d_u);
+            b.arg(&sc.vgx);
+            b.arg(&sc.vgy);
+            b.arg(&sc.vgz);
+            b.arg(&sc.d_pos);
+            b.arg(&n_i);
+            b.arg(&ng_i);
+            b.arg(&h);
+            b.arg(&h3);
+            b.arg(&eta);
+            b.arg(&l);
+            unsafe { b.launch(particle_cfg) }.map_err(driver_err)?;
+        }
 
         let out = self.stream.clone_dtoh(&sc.d_u).map_err(driver_err)?;
         // covariance of `out` is h^3 M^(w); divide by sqrt(h^3) -> M^(w), then the
@@ -1263,10 +1321,31 @@ impl GpuPseWave {
         m_iters: usize,
         rng: &mut R,
     ) -> Result<Vec<Vec3>, ErmakError> {
+        let wp = WaveParams::new(ep.box_l, ep.sigma, ep.a, ng);
+        self.brownian_noise_sinc_wp(pos, ep, &wp, kt, dt, m_iters, rng)
+    }
+
+    /// As [`Self::brownian_noise_sinc`] but with an explicit [`WaveParams`], so a
+    /// truncated-support window gives the O(N P^3) wave half (the real Lanczos half
+    /// is already short-range O(N)). The full step uses this for the O(N log N) path.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any device or cuFFT error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn brownian_noise_sinc_wp<R: Rng + ?Sized>(
+        &self,
+        pos: &[Vec3],
+        ep: &EwaldParams,
+        wp: &WaveParams,
+        kt: f64,
+        dt: f64,
+        m_iters: usize,
+        rng: &mut R,
+    ) -> Result<Vec<Vec3>, ErmakError> {
         let n = pos.len();
         let dim = 3 * n;
         // wave half: single inverse FFT, covariance 2 kT dt M^(w)
-        let wave = self.brownian_wave_noise_sinc(pos, ep, ng, kt, dt, rng)?;
+        let wave = self.brownian_wave_noise_sinc_wp(pos, ep, wp, kt, dt, rng)?;
         // real half: Lanczos sqrt of the SPD real part, covariance 2 kT dt M^(r)
         let normal = Normal::new(0.0, 1.0).expect("unit normal");
         let xi: Vec<f64> = (0..dim).map(|_| normal.sample(rng)).collect();
@@ -1648,6 +1727,54 @@ mod tests {
         );
     }
 
+    // cargo test --features gpu -- --ignored gpu_pse_sinc_trunc_converges --nocapture
+    // The truncated-support sinc^2 wave apply converges to the dense screened
+    // sinc^2 sum as the window grows (the O(N P^3) path used by the truncated step).
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_sinc_trunc_converges_to_dense() {
+        let (l, sigma, a, pos, forces) = setup();
+        let ep = EwaldParams {
+            box_l: l,
+            sigma,
+            r_cut: 13.0,
+            k_max: 12,
+            a,
+        };
+        let u_dense = dense_recip_sinc_apply(&pos, &forces, &ep);
+        let dev = GpuPseWave::new().expect("cuda");
+        let ng = 32usize;
+        let h = l / ng as f64;
+        let eta = h; // ~1 cell: tiny aliasing, compact window
+        let mut prev = f64::INFINITY;
+        let mut finest = f64::INFINITY;
+        for &support in &[3usize, 5, 8] {
+            let wp = WaveParams::truncated(l, sigma, a, ng, eta, support);
+            assert!(
+                wp.is_truncated(),
+                "support {support} must truncate at ng={ng}"
+            );
+            let u = dev
+                .recip_apply_pse_sinc_gpu(&pos, &forces, &wp)
+                .expect("trunc sinc");
+            let err = max_abs(&u_dense, &u);
+            eprintln!(
+                "sinc support={support:>2} (window {}^3) max_abs={err:.3e}",
+                2 * support + 1
+            );
+            assert!(
+                err <= prev,
+                "error must fall with support ({support}: {err:.3e})"
+            );
+            prev = err;
+            finest = err;
+        }
+        assert!(
+            finest < 1e-5,
+            "truncated sinc^2 spreading must match the dense screened sum; {finest:.3e}"
+        );
+    }
+
     // cargo test --features gpu -- --ignored gpu_pse_sinc_full_matches_dense --nocapture
     // The GPU full sinc^2 apply (real-space pse_real_sinc + FFT wave) reproduces
     // the dense full sinc^2 grand mobility apply.
@@ -1823,6 +1950,83 @@ mod tests {
         assert!(
             max_rel < 0.08,
             "sinc full noise FD covariance off by {max_rel:.3}"
+        );
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_sinc_trunc_noise_fd --nocapture
+    // The TRUNCATED-support full noise has covariance 2 kT dt M_sinc_trunc: sampled
+    // covariance matches the truncated full mobility (full_apply_sinc_wp on the same
+    // truncated WaveParams), confirming the truncated gather noise is consistent.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_sinc_trunc_noise_fd_covariance() {
+        let ep = EwaldParams {
+            box_l: 10.0,
+            sigma: 2.5,
+            r_cut: 13.0,
+            k_max: 12,
+            a: 1.0,
+        };
+        let pos = vec![Vec3::new(3.0, 3.0, 3.0), Vec3::new(6.0, 3.0, 3.0)];
+        let n = pos.len();
+        let dim = 3 * n;
+        let (kt, dt) = (1.3_f64, 0.5_f64);
+        let ng = 16usize;
+        let support = 5usize; // window 11^3 < 16 -> truncated
+        let h = ep.box_l / ng as f64;
+        let wp = WaveParams::truncated(ep.box_l, ep.sigma, ep.a, ng, h, support);
+        assert!(wp.is_truncated());
+        let dev = GpuPseWave::new().expect("cuda");
+
+        // M_sinc_trunc column j = truncated full sinc^2 apply to e_j (same wp).
+        let mut msinc = vec![0.0f64; dim * dim];
+        for j in 0..dim {
+            let mut f = vec![Vec3::ZERO; n];
+            match j % 3 {
+                0 => f[j / 3].x = 1.0,
+                1 => f[j / 3].y = 1.0,
+                _ => f[j / 3].z = 1.0,
+            }
+            let col = dev.full_apply_sinc_wp(&pos, &f, &ep, &wp).expect("apply");
+            for i in 0..n {
+                msinc[(3 * i) * dim + j] = col[i].x;
+                msinc[(3 * i + 1) * dim + j] = col[i].y;
+                msinc[(3 * i + 2) * dim + j] = col[i].z;
+            }
+        }
+
+        let mut rng = StdRng::seed_from_u64(20_260_609);
+        let samples = 2_500usize;
+        let mut cov = vec![0.0f64; dim * dim];
+        for _ in 0..samples {
+            let dr = dev
+                .brownian_noise_sinc_wp(&pos, &ep, &wp, kt, dt, dim, &mut rng)
+                .expect("trunc noise");
+            let mut flat = vec![0.0f64; dim];
+            for i in 0..n {
+                flat[3 * i] = dr[i].x;
+                flat[3 * i + 1] = dr[i].y;
+                flat[3 * i + 2] = dr[i].z;
+            }
+            for a in 0..dim {
+                for b in 0..dim {
+                    cov[a * dim + b] += flat[a] * flat[b];
+                }
+            }
+        }
+        let mut max_rel = 0.0f64;
+        for a in 0..dim {
+            for b in 0..dim {
+                let est = cov[a * dim + b] / samples as f64;
+                let target = 2.0 * kt * dt * msinc[a * dim + b];
+                let denom = (2.0 * kt * dt * msinc[a * dim + a]).max(1e-12);
+                max_rel = max_rel.max((est - target).abs() / denom);
+            }
+        }
+        eprintln!("sinc TRUNC-noise FD covariance max_rel={max_rel:.4} over {samples} draws");
+        assert!(
+            max_rel < 0.08,
+            "truncated sinc noise FD covariance off by {max_rel:.3}"
         );
     }
 }
