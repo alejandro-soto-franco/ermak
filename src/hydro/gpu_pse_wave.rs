@@ -26,6 +26,8 @@ use cudarc::driver::{
 use cudarc::nvrtc::compile_ptx;
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn driver_err(e: DriverError) -> ErmakError {
@@ -262,6 +264,13 @@ pub struct GpuPseWave {
     scale: CudaFunction,
     gather: CudaFunction,
     real: CudaFunction,
+    /// cuFFT plans cached by grid size `ng`: a plan is built once per `ng` and
+    /// reused across every `recip_apply_pse_gpu` call, rather than re-planned on
+    /// each apply. A Lanczos noise draw makes 3N matvecs (each a `full_apply`), so
+    /// the engine plans many times for one `ng`; the cache avoids that redundant
+    /// planning and the work-area reallocation it carries (the win grows with `ng`,
+    /// where planning is pricier). `RefCell` because the apply takes `&self`.
+    fft_cache: RefCell<HashMap<usize, Fft3d>>,
 }
 
 impl GpuPseWave {
@@ -287,6 +296,7 @@ impl GpuPseWave {
             scale,
             gather,
             real,
+            fft_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -404,7 +414,14 @@ impl GpuPseWave {
         unsafe { b.launch(grid_cfg) }.map_err(driver_err)?;
 
         // --- 2. forward FFT each component (spread grids reused as scratch) ---
-        let fft = Fft3d::new(self.stream.clone(), ng, ng, ng)?;
+        // Reuse the cached cuFFT plan for this grid size, building it on first use.
+        let mut cache = self.fft_cache.borrow_mut();
+        let fft = match cache.entry(ng) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Fft3d::new(self.stream.clone(), ng, ng, ng)?)
+            }
+        };
         fft.forward(&mut hgx, &mut fkx)?;
         fft.forward(&mut hgy, &mut fky)?;
         fft.forward(&mut hgz, &mut fkz)?;
