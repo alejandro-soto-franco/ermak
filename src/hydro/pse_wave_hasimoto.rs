@@ -192,6 +192,43 @@ pub fn self_real_sinc(ep: &EwaldParams) -> Mat3 {
     Mat3::identity().scale(a4 / (6.0 * a))
 }
 
+/// Assemble the full periodic sinc^2 / Hasimoto grand mobility (equal radius),
+/// GRPerY units, row-major `3N x 3N`. Each block is `M^(r) + M^(w)`: the
+/// short-range real part ([`real_sinc_block`]) plus the screened wave part
+/// ([`recip_sinc_block`]); the diagonal also carries the A4 self term
+/// ([`self_real_sinc`]). Unlike [`crate::hydro::ewald::periodic_grand_mobility`]
+/// there is no separate `mu0` and no k=0 backflow: the positive sinc^2 split puts
+/// the entire self mobility in the real+wave decomposition, and the result is
+/// independent of the splitting width `sigma` (the `xi`-invariance test).
+#[must_use]
+pub fn periodic_grand_mobility_sinc(pos: &[Vec3], ep: &EwaldParams) -> Vec<f64> {
+    let n = pos.len();
+    let dim = 3 * n;
+    let mut m = vec![0.0f64; dim * dim];
+    let diag = self_real_sinc(ep)
+        .add(real_sinc_block(Vec3::ZERO, ep, true))
+        .add(recip_sinc_block(Vec3::ZERO, ep, true));
+    for i in 0..n {
+        for r in 0..3 {
+            for c in 0..3 {
+                m[(3 * i + r) * dim + (3 * i + c)] = diag.0[3 * r + c];
+            }
+        }
+        for j in (i + 1)..n {
+            let rij = pos[i] - pos[j];
+            let block = real_sinc_block(rij, ep, false).add(recip_sinc_block(rij, ep, true));
+            for r in 0..3 {
+                for c in 0..3 {
+                    let v = block.0[3 * r + c];
+                    m[(3 * i + r) * dim + (3 * j + c)] = v;
+                    m[(3 * j + c) * dim + (3 * i + r)] = v;
+                }
+            }
+        }
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +370,53 @@ mod tests {
         assert!(
             cholesky(&m, dim).is_ok(),
             "sinc^2 wave-only grand mobility must be SPD (positive split)"
+        );
+    }
+
+    fn two_particle_box() -> Vec<Vec3> {
+        vec![Vec3::new(2.0, 3.0, 4.0), Vec3::new(6.0, 5.0, 7.0)]
+    }
+
+    /// The full sinc^2 grand mobility (real + wave + A4 self) is SPD.
+    #[test]
+    fn sinc_full_mobility_is_spd() {
+        let ep = EwaldParams {
+            box_l: 10.0,
+            sigma: SIGMA,
+            r_cut: 13.0,
+            k_max: 14,
+            a: A,
+        };
+        let m = periodic_grand_mobility_sinc(&two_particle_box(), &ep);
+        assert!(cholesky(&m, 6).is_ok(), "full sinc^2 mobility not SPD");
+    }
+
+    /// xi-invariance (the strong consistency check): the assembled mobility must
+    /// not depend on the splitting width sigma, since real(sigma) + wave(sigma)
+    /// reconstruct the sigma-free unsplit sum. If F,G, the wave H, or the A4 self
+    /// were mutually inconsistent, the two sigma values would disagree. The floor
+    /// is the erfc approximation (the real-space screen), so the tolerance is ~1e-3.
+    #[test]
+    fn sinc_mobility_is_independent_of_sigma() {
+        let pos = two_particle_box();
+        let base = EwaldParams {
+            box_l: 10.0,
+            sigma: 2.0,
+            r_cut: 14.0,
+            k_max: 16,
+            a: 1.0,
+        };
+        let alt = EwaldParams { sigma: 3.0, ..base };
+        let m1 = periodic_grand_mobility_sinc(&pos, &base);
+        let m2 = periodic_grand_mobility_sinc(&pos, &alt);
+        let mut max_abs = 0.0f64;
+        for k in 0..36 {
+            max_abs = max_abs.max((m1[k] - m2[k]).abs());
+        }
+        eprintln!("sinc xi-invariance max diff = {max_abs:.3e}");
+        assert!(
+            max_abs < 1e-3,
+            "sinc^2 mobility must be sigma-invariant; {max_abs:.2e}"
         );
     }
 }
