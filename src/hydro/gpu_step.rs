@@ -162,6 +162,52 @@ pub fn em_step_hi_pse_gpu<R: Rng + ?Sized>(
     Ok(())
 }
 
+/// Advance one Ermak-McCammon step on the positively-split sinc^2 / Hasimoto PSE
+/// path: the drift uses [`GpuPseWave::full_apply_sinc`] and the noise the
+/// single-FFT wave draw plus the Lanczos real draw ([`GpuPseWave::brownian_noise_sinc`]),
+/// in place of [`em_step_hi_pse_gpu`]'s GRPerY polynomial kernel. The sinc^2
+/// mobility is in the same GRPerY units (`M_grpery = pi eta M_phys`, self
+/// `1/(6a)`), so the `inv_pi_eta` / `kt inv_pi_eta` folding is identical. The
+/// sinc^2 and GRPerY kernels are both valid far-field RPY; they differ only in
+/// the high-k (overlap) regularization, and only sinc^2 admits the single-FFT
+/// positive-split noise. `ng` is the wave-grid size; `m_iters` the Lanczos depth
+/// for the SHORT-RANGE real part only (the wave noise needs no iteration).
+///
+/// # Errors
+/// [`ErmakError::Gpu`] on any device or cuFFT error.
+#[allow(clippy::too_many_arguments)]
+pub fn em_step_hi_pse_sinc_gpu<R: Rng + ?Sized>(
+    dev: &GpuPseWave,
+    pos: &mut [Vec3],
+    charge: &[f64],
+    ep: &EwaldParams,
+    fp: ForceParams,
+    eta: f64,
+    kt: f64,
+    dt: f64,
+    ng: usize,
+    m_iters: usize,
+    rng: &mut R,
+) -> Result<(), ErmakError> {
+    let n = pos.len();
+    let inv_pi_eta = 1.0 / (PI * eta);
+    let forces = periodic_pair_forces(pos, charge, ep.box_l, fp);
+
+    let d_grpery = dev.full_apply_sinc(pos, &forces, ep, ng)?;
+    let drift: Vec<Vec3> = d_grpery.iter().map(|u| u.scale(inv_pi_eta)).collect();
+    let noise = dev.brownian_noise_sinc(pos, ep, ng, kt * inv_pi_eta, dt, m_iters, rng)?;
+
+    for i in 0..n {
+        pos[i] += drift[i].scale(dt) + noise[i];
+        pos[i] = Vec3::new(
+            wrap(pos[i].x, ep.box_l),
+            wrap(pos[i].y, ep.box_l),
+            wrap(pos[i].z, ep.box_l),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +345,51 @@ mod tests {
         assert!(
             max_abs < 1e-12,
             "PSE drift step must equal M_phys F dt; {max_abs:.3e}"
+        );
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_sinc_step_drift --nocapture
+    // At kT=0 the sinc^2 step is pure drift: pos must advance by M_phys F dt with
+    // M_phys = full_apply_sinc * inv_pi_eta (bit-exact, no noise).
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_sinc_step_drift_matches_apply() {
+        use crate::hydro::gpu_pse_wave::GpuPseWave;
+        let ep = ep10();
+        let eta = 0.31;
+        let inv_pi_eta = 1.0 / (PI * eta);
+        let dt = 0.001;
+        let ng = 24usize;
+        let mut pos = vec![Vec3::new(4.0, 5.0, 5.0), Vec3::new(5.2, 5.0, 5.0)];
+        let charge = vec![0.0, 0.0];
+        let start = pos.clone();
+        let forces = periodic_pair_forces(&pos, &charge, ep.box_l, FP);
+
+        let dev = GpuPseWave::new().expect("cuda");
+        let u = dev
+            .full_apply_sinc(&pos, &forces, &ep, ng)
+            .expect("full_apply_sinc");
+        let mut rng = StdRng::seed_from_u64(1);
+        em_step_hi_pse_sinc_gpu(
+            &dev, &mut pos, &charge, &ep, FP, eta, 0.0, dt, ng, 6, &mut rng,
+        )
+        .expect("pse sinc step");
+
+        let mut max_abs = 0.0f64;
+        for i in 0..pos.len() {
+            let expect = start[i] + u[i].scale(inv_pi_eta * dt);
+            for (a, b) in [
+                (pos[i].x, expect.x),
+                (pos[i].y, expect.y),
+                (pos[i].z, expect.z),
+            ] {
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        eprintln!("pse sinc step-drift vs full_apply_sinc: max_abs={max_abs:.3e}");
+        assert!(
+            max_abs < 1e-12,
+            "sinc^2 PSE drift step must equal M_phys F dt; {max_abs:.3e}"
         );
     }
 

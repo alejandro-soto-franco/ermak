@@ -1217,6 +1217,71 @@ impl GpuPseWave {
             })
             .collect())
     }
+
+    /// Real-space sinc^2 matvec on a flat `3N` vector via [`Self::real_apply_sinc_gpu`],
+    /// for the real-space Lanczos noise driver. The sinc^2 real part is SPD (the
+    /// positive split), so it has a real square root.
+    fn real_sinc_matvec(
+        &self,
+        pos: &[Vec3],
+        ep: &EwaldParams,
+        z: &[f64],
+    ) -> Result<Vec<f64>, ErmakError> {
+        let n = pos.len();
+        let zf: Vec<Vec3> = (0..n)
+            .map(|i| Vec3::new(z[3 * i], z[3 * i + 1], z[3 * i + 2]))
+            .collect();
+        let out = self.real_apply_sinc_gpu(pos, &zf, ep)?;
+        let mut flat = vec![0.0f64; 3 * n];
+        for i in 0..n {
+            flat[3 * i] = out[i].x;
+            flat[3 * i + 1] = out[i].y;
+            flat[3 * i + 2] = out[i].z;
+        }
+        Ok(flat)
+    }
+
+    /// Full positively-split Brownian displacement on the sinc^2 / Hasimoto kernel,
+    /// covariance `2 kT dt M_sinc` with `M_sinc = M^(r) + M^(w)`. The two halves are
+    /// drawn from INDEPENDENT noise and added: the wave half by the single-FFT
+    /// direct draw ([`Self::brownian_wave_noise_sinc`], covariance `2 kT dt M^(w)`)
+    /// and the real half by a Lanczos square root of the SPD real part (covariance
+    /// `2 kT dt M^(r)`); independence makes the total covariance the sum. The wave
+    /// half needs NO Krylov iteration (one FFT), so only the short-range real part
+    /// carries the iterative cost.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any device or cuFFT error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn brownian_noise_sinc<R: Rng + ?Sized>(
+        &self,
+        pos: &[Vec3],
+        ep: &EwaldParams,
+        ng: usize,
+        kt: f64,
+        dt: f64,
+        m_iters: usize,
+        rng: &mut R,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        let n = pos.len();
+        let dim = 3 * n;
+        // wave half: single inverse FFT, covariance 2 kT dt M^(w)
+        let wave = self.brownian_wave_noise_sinc(pos, ep, ng, kt, dt, rng)?;
+        // real half: Lanczos sqrt of the SPD real part, covariance 2 kT dt M^(r)
+        let normal = Normal::new(0.0, 1.0).expect("unit normal");
+        let xi: Vec<f64> = (0..dim).map(|_| normal.sample(rng)).collect();
+        let half = lanczos_half_apply(|v| self.real_sinc_matvec(pos, ep, v), &xi, m_iters)?;
+        let scale = (2.0 * kt * dt).sqrt();
+        Ok((0..n)
+            .map(|i| {
+                Vec3::new(
+                    wave[i].x + scale * half[3 * i],
+                    wave[i].y + scale * half[3 * i + 1],
+                    wave[i].z + scale * half[3 * i + 2],
+                )
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1685,6 +1750,79 @@ mod tests {
         assert!(
             max_rel < 0.08,
             "sinc wave noise FD covariance off by {max_rel:.3}"
+        );
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_sinc_full_noise_fd --nocapture
+    // The FULL positive-split noise (single-FFT wave + Lanczos real) has covariance
+    // 2 kT dt M_sinc: sampled covariance matches the full sinc^2 mobility M_sinc
+    // (built column-by-column from full_apply_sinc at the same ng).
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_sinc_full_noise_fd_covariance() {
+        let ep = EwaldParams {
+            box_l: 10.0,
+            sigma: 2.5,
+            r_cut: 13.0,
+            k_max: 12,
+            a: 1.0,
+        };
+        let pos = vec![Vec3::new(3.0, 3.0, 3.0), Vec3::new(6.0, 3.0, 3.0)];
+        let n = pos.len();
+        let dim = 3 * n;
+        let (kt, dt) = (1.3_f64, 0.5_f64);
+        let ng = 16usize;
+        let dev = GpuPseWave::new().expect("cuda");
+
+        // M_sinc column j = full sinc^2 apply to the unit force e_j (same ng).
+        let mut msinc = vec![0.0f64; dim * dim];
+        for j in 0..dim {
+            let mut f = vec![Vec3::ZERO; n];
+            match j % 3 {
+                0 => f[j / 3].x = 1.0,
+                1 => f[j / 3].y = 1.0,
+                _ => f[j / 3].z = 1.0,
+            }
+            let col = dev.full_apply_sinc(&pos, &f, &ep, ng).expect("apply");
+            for i in 0..n {
+                msinc[(3 * i) * dim + j] = col[i].x;
+                msinc[(3 * i + 1) * dim + j] = col[i].y;
+                msinc[(3 * i + 2) * dim + j] = col[i].z;
+            }
+        }
+
+        let mut rng = StdRng::seed_from_u64(20_260_608);
+        let samples = 2_500usize;
+        let mut cov = vec![0.0f64; dim * dim];
+        for _ in 0..samples {
+            let dr = dev
+                .brownian_noise_sinc(&pos, &ep, ng, kt, dt, dim, &mut rng)
+                .expect("full sinc noise");
+            let mut flat = vec![0.0f64; dim];
+            for i in 0..n {
+                flat[3 * i] = dr[i].x;
+                flat[3 * i + 1] = dr[i].y;
+                flat[3 * i + 2] = dr[i].z;
+            }
+            for a in 0..dim {
+                for b in 0..dim {
+                    cov[a * dim + b] += flat[a] * flat[b];
+                }
+            }
+        }
+        let mut max_rel = 0.0f64;
+        for a in 0..dim {
+            for b in 0..dim {
+                let est = cov[a * dim + b] / samples as f64;
+                let target = 2.0 * kt * dt * msinc[a * dim + b];
+                let denom = (2.0 * kt * dt * msinc[a * dim + a]).max(1e-12);
+                max_rel = max_rel.max((est - target).abs() / denom);
+            }
+        }
+        eprintln!("sinc FULL-noise FD covariance max_rel={max_rel:.4} over {samples} draws");
+        assert!(
+            max_rel < 0.08,
+            "sinc full noise FD covariance off by {max_rel:.3}"
         );
     }
 }
