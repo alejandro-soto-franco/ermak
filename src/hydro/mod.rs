@@ -15,6 +15,7 @@ pub mod gpu_step;
 pub mod mat3;
 pub mod mobility;
 pub mod noise;
+pub mod pse_wave;
 pub mod rpy;
 
 use crate::vec3::Vec3;
