@@ -21,7 +21,7 @@ use crate::hydro::pse_wave::WaveParams;
 use crate::vec3::Vec3;
 use cudarc::cufft::sys::double2;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 use rand::Rng;
@@ -255,8 +255,60 @@ extern "C" __global__ void pse_real(
 }
 "#;
 
+/// Reusable device buffers for the wave-space apply, sized to `(n, ng)`. Cached so
+/// a Lanczos noise solve (3N matvecs, each a `full_apply`) does not reallocate the
+/// twelve `ng^3` complex grids on every matvec. The grids are never zeroed: every
+/// element is written by spread / scale / FFT / gather before it is read.
+struct Scratch {
+    n: usize,
+    ng: usize,
+    d_pos: CudaSlice<f64>,
+    d_f: CudaSlice<f64>,
+    d_u: CudaSlice<f64>,
+    hgx: CudaSlice<double2>,
+    hgy: CudaSlice<double2>,
+    hgz: CudaSlice<double2>,
+    fkx: CudaSlice<double2>,
+    fky: CudaSlice<double2>,
+    fkz: CudaSlice<double2>,
+    vkx: CudaSlice<double2>,
+    vky: CudaSlice<double2>,
+    vkz: CudaSlice<double2>,
+    vgx: CudaSlice<double2>,
+    vgy: CudaSlice<double2>,
+    vgz: CudaSlice<double2>,
+}
+
+impl Scratch {
+    fn new(stream: &Arc<CudaStream>, n: usize, ng: usize) -> Result<Self, ErmakError> {
+        let ng3 = ng * ng * ng;
+        let cx = || stream.alloc_zeros::<double2>(ng3).map_err(driver_err);
+        let f3 = || stream.alloc_zeros::<f64>(3 * n).map_err(driver_err);
+        Ok(Self {
+            n,
+            ng,
+            d_pos: f3()?,
+            d_f: f3()?,
+            d_u: f3()?,
+            hgx: cx()?,
+            hgy: cx()?,
+            hgz: cx()?,
+            fkx: cx()?,
+            fky: cx()?,
+            fkz: cx()?,
+            vkx: cx()?,
+            vky: cx()?,
+            vkz: cx()?,
+            vgx: cx()?,
+            vgy: cx()?,
+            vgz: cx()?,
+        })
+    }
+}
+
 /// GPU Spectral-Ewald reciprocal mobility. Holds the context, stream, and the
-/// spread/scale/gather kernels; the cuFFT plan is built per call (sized to `ng`).
+/// spread/scale/gather kernels; cuFFT plans and device buffers are cached and
+/// reused across applies (keyed by grid size).
 pub struct GpuPseWave {
     _ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -264,6 +316,10 @@ pub struct GpuPseWave {
     scale: CudaFunction,
     gather: CudaFunction,
     real: CudaFunction,
+    /// Reusable device buffers (the twelve `ng^3` grids plus the `3n` vectors),
+    /// keyed by `(n, ng)`; rebuilt only when the size changes. `RefCell` because
+    /// the apply takes `&self`.
+    scratch: RefCell<Option<Scratch>>,
     /// cuFFT plans cached by grid size `ng`: a plan is built once per `ng` and
     /// reused across every `recip_apply_pse_gpu` call, rather than re-planned on
     /// each apply. A Lanczos noise draw makes 3N matvecs (each a `full_apply`), so
@@ -296,6 +352,7 @@ impl GpuPseWave {
             scale,
             gather,
             real,
+            scratch: RefCell::new(None),
             fft_cache: RefCell::new(HashMap::new()),
         })
     }
@@ -331,60 +388,21 @@ impl GpuPseWave {
 
         let host_pos: Vec<f64> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
         let host_f: Vec<f64> = forces.iter().flat_map(|f| [f.x, f.y, f.z]).collect();
-        let d_pos = self.stream.clone_htod(&host_pos).map_err(driver_err)?;
-        let d_f = self.stream.clone_htod(&host_f).map_err(driver_err)?;
 
-        // Complex grids: spread output (also cuFFT scratch), forward transforms,
-        // scaled modes, inverse transforms (velocity field).
-        let mut hgx = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
+        // Reusable device buffers sized to (n, ng); rebuilt only on a size change
+        // (see `Scratch`). Positions and forces are copied into the cached buffers
+        // rather than reallocated each call.
+        let mut guard = self.scratch.borrow_mut();
+        if guard.as_ref().is_none_or(|sc| sc.n != n || sc.ng != ng) {
+            *guard = Some(Scratch::new(&self.stream, n, ng)?);
+        }
+        let sc = guard.as_mut().expect("scratch present");
+        self.stream
+            .memcpy_htod(&host_pos, &mut sc.d_pos)
             .map_err(driver_err)?;
-        let mut hgy = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
+        self.stream
+            .memcpy_htod(&host_f, &mut sc.d_f)
             .map_err(driver_err)?;
-        let mut hgz = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut fkx = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut fky = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut fkz = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut vkx = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut vky = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut vkz = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut vgx = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut vgy = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut vgz = self
-            .stream
-            .alloc_zeros::<double2>(ng3)
-            .map_err(driver_err)?;
-        let mut d_u = self.stream.alloc_zeros::<f64>(3 * n).map_err(driver_err)?;
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let n_i = n as i32;
@@ -401,11 +419,11 @@ impl GpuPseWave {
             shared_mem_bytes: 0,
         };
         let mut b = self.stream.launch_builder(&self.spread);
-        b.arg(&mut hgx);
-        b.arg(&mut hgy);
-        b.arg(&mut hgz);
-        b.arg(&d_pos);
-        b.arg(&d_f);
+        b.arg(&mut sc.hgx);
+        b.arg(&mut sc.hgy);
+        b.arg(&mut sc.hgz);
+        b.arg(&sc.d_pos);
+        b.arg(&sc.d_f);
         b.arg(&n_i);
         b.arg(&ng_i);
         b.arg(&h);
@@ -422,18 +440,18 @@ impl GpuPseWave {
                 e.insert(Fft3d::new(self.stream.clone(), ng, ng, ng)?)
             }
         };
-        fft.forward(&mut hgx, &mut fkx)?;
-        fft.forward(&mut hgy, &mut fky)?;
-        fft.forward(&mut hgz, &mut fkz)?;
+        fft.forward(&mut sc.hgx, &mut sc.fkx)?;
+        fft.forward(&mut sc.hgy, &mut sc.fky)?;
+        fft.forward(&mut sc.hgz, &mut sc.fkz)?;
 
         // --- 3. scale each mode by D(k) ---
         let mut b = self.stream.launch_builder(&self.scale);
-        b.arg(&mut vkx);
-        b.arg(&mut vky);
-        b.arg(&mut vkz);
-        b.arg(&fkx);
-        b.arg(&fky);
-        b.arg(&fkz);
+        b.arg(&mut sc.vkx);
+        b.arg(&mut sc.vky);
+        b.arg(&mut sc.vkz);
+        b.arg(&sc.fkx);
+        b.arg(&sc.fky);
+        b.arg(&sc.fkz);
         b.arg(&ng_i);
         b.arg(&two_pi_l);
         b.arg(&h3);
@@ -444,9 +462,9 @@ impl GpuPseWave {
         unsafe { b.launch(grid_cfg) }.map_err(driver_err)?;
 
         // --- 4. inverse FFT each component ---
-        fft.inverse(&mut vkx, &mut vgx)?;
-        fft.inverse(&mut vky, &mut vgy)?;
-        fft.inverse(&mut vkz, &mut vgz)?;
+        fft.inverse(&mut sc.vkx, &mut sc.vgx)?;
+        fft.inverse(&mut sc.vky, &mut sc.vgy)?;
+        fft.inverse(&mut sc.vkz, &mut sc.vgz)?;
 
         // --- 5. gather (one thread per particle) ---
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -457,11 +475,11 @@ impl GpuPseWave {
             shared_mem_bytes: 0,
         };
         let mut b = self.stream.launch_builder(&self.gather);
-        b.arg(&mut d_u);
-        b.arg(&vgx);
-        b.arg(&vgy);
-        b.arg(&vgz);
-        b.arg(&d_pos);
+        b.arg(&mut sc.d_u);
+        b.arg(&sc.vgx);
+        b.arg(&sc.vgy);
+        b.arg(&sc.vgz);
+        b.arg(&sc.d_pos);
         b.arg(&n_i);
         b.arg(&ng_i);
         b.arg(&h);
@@ -470,7 +488,7 @@ impl GpuPseWave {
         b.arg(&l);
         unsafe { b.launch(gcfg) }.map_err(driver_err)?;
 
-        let out = self.stream.clone_dtoh(&d_u).map_err(driver_err)?;
+        let out = self.stream.clone_dtoh(&sc.d_u).map_err(driver_err)?;
         Ok((0..n)
             .map(|i| Vec3::new(out[3 * i], out[3 * i + 1], out[3 * i + 2]))
             .collect())
