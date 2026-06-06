@@ -25,6 +25,8 @@ use crate::hydro::gpu_noise::lanczos_half_apply;
 use crate::hydro::pse_wave::WaveParams;
 use crate::vec3::Vec3;
 use cudarc::cufft::sys::double2;
+use cudarc::curand::CudaRng;
+use cudarc::curand::result::CurandError;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
@@ -37,6 +39,10 @@ use std::sync::Arc;
 
 fn driver_err(e: DriverError) -> ErmakError {
     ErmakError::Gpu(format!("cuda driver: {e:?}"))
+}
+
+fn curand_err(e: CurandError) -> ErmakError {
+    ErmakError::Gpu(format!("curand: {e:?}"))
 }
 
 /// NVRTC kernels: Gaussian spread, k-space Green scaling, Gaussian gather. The
@@ -551,6 +557,12 @@ struct Scratch {
     vgx: CudaSlice<double2>,
     vgy: CudaSlice<double2>,
     vgz: CudaSlice<double2>,
+    // curand white-noise grids for the single-FFT wave noise: 2*ng^3 f64 each (the
+    // real/imag interleave of an ng^3 complex grid). alloc_zeros is 256-byte
+    // aligned, so each can be read as a `double2*` by `pse_noise_scale`.
+    wn_x: CudaSlice<f64>,
+    wn_y: CudaSlice<f64>,
+    wn_z: CudaSlice<f64>,
 }
 
 impl Scratch {
@@ -558,6 +570,7 @@ impl Scratch {
         let ng3 = ng * ng * ng;
         let cx = || stream.alloc_zeros::<double2>(ng3).map_err(driver_err);
         let f3 = || stream.alloc_zeros::<f64>(3 * n).map_err(driver_err);
+        let wn = || stream.alloc_zeros::<f64>(2 * ng3).map_err(driver_err);
         Ok(Self {
             n,
             ng,
@@ -576,6 +589,9 @@ impl Scratch {
             vgx: cx()?,
             vgy: cx()?,
             vgz: cx()?,
+            wn_x: wn()?,
+            wn_y: wn()?,
+            wn_z: wn()?,
         })
     }
 }
@@ -606,6 +622,11 @@ pub struct GpuPseWave {
     /// planning and the work-area reallocation it carries (the win grows with `ng`,
     /// where planning is pricier). `RefCell` because the apply takes `&self`.
     fft_cache: RefCell<HashMap<usize, Fft3d>>,
+    /// On-device curand generator for the single-FFT wave noise: fills the
+    /// white-noise grids directly on the GPU, replacing the host normal draw plus
+    /// host-to-device copy (the per-draw bottleneck). `fill_with_normal` takes
+    /// `&self`, so no interior mutability is needed.
+    rng: CudaRng,
 }
 
 impl GpuPseWave {
@@ -635,6 +656,7 @@ impl GpuPseWave {
         let gather_trunc = module
             .load_function("pse_gather_trunc")
             .map_err(driver_err)?;
+        let stream_for_rng = stream.clone();
         Ok(Self {
             _ctx: ctx,
             stream,
@@ -649,6 +671,7 @@ impl GpuPseWave {
             gather_trunc,
             scratch: RefCell::new(None),
             fft_cache: RefCell::new(HashMap::new()),
+            rng: CudaRng::new(0x5eed_06a0_5eed_06a0, stream_for_rng).map_err(curand_err)?,
         })
     }
 
@@ -1088,28 +1111,30 @@ impl GpuPseWave {
     /// `sqrt(2 kT dt) M^(w)^{1/2} xi` with covariance `2 kT dt M^(w)`, `M^(w)` the
     /// screened sinc^2 wave mobility ([`Self::recip_apply_pse_sinc_gpu`]). Generated
     /// in ONE inverse FFT (no Krylov iteration): fill the k-grid with complex white
-    /// noise, scale each mode by `sqrt(D(k))` (`pse_noise_scale`, a PSD scalar times
-    /// the projection), inverse FFT, gather. The construction is exact because the
-    /// wave Green factor is `(positive scalar)(I - k_hat k_hat)`, which the
-    /// indefinite GRPerY split forbids. The gather carries an extra `h^3` (it is
-    /// `h^3 spread^T`), so the gathered field has covariance `h^3 M^(w)`; the
-    /// `1/sqrt(h^3)` factor below corrects it, and `Re` is taken implicitly by the
-    /// gather reading the real grid component (with `<a a^H> = 2 I` this gives the
-    /// `1/2` that the real part needs).
+    /// noise (on-device via curand), scale each mode by `sqrt(D(k))`
+    /// (`pse_noise_scale`, a PSD scalar times the projection), inverse FFT, gather.
+    /// The construction is exact because the wave Green factor is
+    /// `(positive scalar)(I - k_hat k_hat)`, which the indefinite GRPerY split
+    /// forbids. The gather carries an extra `h^3` (it is `h^3 spread^T`), so the
+    /// gathered field has covariance `h^3 M^(w)`; the `1/sqrt(h^3)` factor below
+    /// corrects it, and `Re` is taken implicitly by the gather reading the real grid
+    /// component (with `<a a^H> = 2 I` this gives the `1/2` that the real part needs).
+    ///
+    /// The white noise is generated on the GPU by the device curand generator, so
+    /// there is no host draw or host-to-device copy.
     ///
     /// # Errors
     /// [`ErmakError::Gpu`] on any device or cuFFT error.
-    pub fn brownian_wave_noise_sinc<R: Rng + ?Sized>(
+    pub fn brownian_wave_noise_sinc(
         &self,
         pos: &[Vec3],
         ep: &EwaldParams,
         ng: usize,
         kt: f64,
         dt: f64,
-        rng: &mut R,
     ) -> Result<Vec<Vec3>, ErmakError> {
         let wp = WaveParams::new(ep.box_l, ep.sigma, ep.a, ng);
-        self.brownian_wave_noise_sinc_wp(pos, ep, &wp, kt, dt, rng)
+        self.brownian_wave_noise_sinc_wp(pos, ep, &wp, kt, dt)
     }
 
     /// As [`Self::brownian_wave_noise_sinc`] but with an explicit [`WaveParams`], so
@@ -1121,14 +1146,13 @@ impl GpuPseWave {
     ///
     /// # Errors
     /// [`ErmakError::Gpu`] on any device or cuFFT error.
-    pub fn brownian_wave_noise_sinc_wp<R: Rng + ?Sized>(
+    pub fn brownian_wave_noise_sinc_wp(
         &self,
         pos: &[Vec3],
         ep: &EwaldParams,
         wp: &WaveParams,
         kt: f64,
         dt: f64,
-        rng: &mut R,
     ) -> Result<Vec<Vec3>, ErmakError> {
         let n = pos.len();
         let ng = wp.ng;
@@ -1146,19 +1170,6 @@ impl GpuPseWave {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let support_i = wp.support as i32;
 
-        // Complex white noise on the k-grid: Re, Im ~ N(0,1) so <a a^H> = 2 I.
-        let normal = Normal::new(0.0, 1.0).expect("unit normal");
-        let mut draw = || -> Vec<double2> {
-            (0..ng3)
-                .map(|_| double2 {
-                    x: normal.sample(rng),
-                    y: normal.sample(rng),
-                })
-                .collect()
-        };
-        let host_wx = draw();
-        let host_wy = draw();
-        let host_wz = draw();
         let host_pos: Vec<f64> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -1179,9 +1190,10 @@ impl GpuPseWave {
             shared_mem_bytes: 0,
         };
 
-        // Reuse the cached buffer arena (keyed by n, ng): the white noise lands in
-        // the k-space force grids fk*, is scaled into vk*, inverse-FFT'd into vg*,
-        // and gathered. No per-draw device allocation (matters for per-step noise).
+        // Reuse the cached buffer arena (keyed by n, ng). The white noise is drawn
+        // ON-DEVICE by curand directly into the wn_* grids (no host draw / htod);
+        // it is scaled into vk*, inverse-FFT'd into vg*, and gathered. No per-draw
+        // device allocation (matters for per-step noise).
         let mut guard = self.scratch.borrow_mut();
         if guard.as_ref().is_none_or(|sc| sc.n != n || sc.ng != ng) {
             *guard = Some(Scratch::new(&self.stream, n, ng)?);
@@ -1190,24 +1202,26 @@ impl GpuPseWave {
         self.stream
             .memcpy_htod(&host_pos, &mut sc.d_pos)
             .map_err(driver_err)?;
-        self.stream
-            .memcpy_htod(&host_wx, &mut sc.fkx)
-            .map_err(driver_err)?;
-        self.stream
-            .memcpy_htod(&host_wy, &mut sc.fky)
-            .map_err(driver_err)?;
-        self.stream
-            .memcpy_htod(&host_wz, &mut sc.fkz)
-            .map_err(driver_err)?;
+        // Re, Im ~ N(0,1) (so <a a^H> = 2 I): 2*ng^3 normals per component, read by
+        // pse_noise_scale as the (re, im) interleave of an ng^3 complex grid.
+        self.rng
+            .fill_with_normal(&mut sc.wn_x, 0.0, 1.0)
+            .map_err(curand_err)?;
+        self.rng
+            .fill_with_normal(&mut sc.wn_y, 0.0, 1.0)
+            .map_err(curand_err)?;
+        self.rng
+            .fill_with_normal(&mut sc.wn_z, 0.0, 1.0)
+            .map_err(curand_err)?;
 
-        // scale white noise by sqrt(D(k)): vk* = sqrt(D) (I - k_hat k_hat) fk*
+        // scale white noise by sqrt(D(k)): vk* = sqrt(D) (I - k_hat k_hat) wn*
         let mut b = self.stream.launch_builder(&self.noise_scale);
         b.arg(&mut sc.vkx);
         b.arg(&mut sc.vky);
         b.arg(&mut sc.vkz);
-        b.arg(&sc.fkx);
-        b.arg(&sc.fky);
-        b.arg(&sc.fkz);
+        b.arg(&sc.wn_x);
+        b.arg(&sc.wn_y);
+        b.arg(&sc.wn_z);
         b.arg(&ng_i);
         b.arg(&two_pi_l);
         b.arg(&h3);
@@ -1344,8 +1358,8 @@ impl GpuPseWave {
     ) -> Result<Vec<Vec3>, ErmakError> {
         let n = pos.len();
         let dim = 3 * n;
-        // wave half: single inverse FFT, covariance 2 kT dt M^(w)
-        let wave = self.brownian_wave_noise_sinc_wp(pos, ep, wp, kt, dt, rng)?;
+        // wave half: single inverse FFT (curand white noise), covariance 2 kT dt M^(w)
+        let wave = self.brownian_wave_noise_sinc_wp(pos, ep, wp, kt, dt)?;
         // real half: Lanczos sqrt of the SPD real part, covariance 2 kT dt M^(r)
         let normal = Normal::new(0.0, 1.0).expect("unit normal");
         let xi: Vec<f64> = (0..dim).map(|_| normal.sample(rng)).collect();
@@ -1845,12 +1859,11 @@ mod tests {
             }
         }
 
-        let mut rng = StdRng::seed_from_u64(20_260_607);
         let samples = 2_500usize;
         let mut cov = vec![0.0f64; dim * dim];
         for _ in 0..samples {
             let dr = dev
-                .brownian_wave_noise_sinc(&pos, &ep, ng, kt, dt, &mut rng)
+                .brownian_wave_noise_sinc(&pos, &ep, ng, kt, dt)
                 .expect("wave noise");
             let mut flat = vec![0.0f64; dim];
             for i in 0..n {

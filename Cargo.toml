@@ -27,6 +27,7 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
     "driver",
     "nvrtc",
     "cufft",
+    "curand",
     "dynamic-loading",
     "cuda-13010",
 ] }
