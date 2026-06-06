@@ -362,6 +362,96 @@ extern "C" __global__ void pse_real(
     u[3*i+0] = ux; u[3*i+1] = uy; u[3*i+2] = uz;
 }
 
+// Real-space scalar mobility functions F,G for the sinc^2 / Hasimoto kernel
+// (Fiore 2017 eqs A2/A3 + Appendix A), dimensionless; the caller applies 1/(6a).
+// Ported verbatim from pse_wave_hasimoto::fg_scalars (verified vs the defining
+// integrals). xi = 1/(sigma sqrt 2). Only f0,g0 differ between r>2a and r<=2a.
+__device__ __forceinline__ void fg_sinc(double r, double a, double xi, double *Fo, double *Go) {
+    const double PI = 3.14159265358979323846;
+    double sqrt_pi = sqrt(PI);
+    double r2 = r*r, r3 = r2*r, r4 = r2*r2;
+    double xi2 = xi*xi, xi3 = xi2*xi, xi4 = xi2*xi2;
+    double rm = r - 2.0*a, rp = r + 2.0*a;
+    double e_r = exp(-r2*xi2), e_rm = exp(-rm*rm*xi2), e_rp = exp(-rp*rp*xi2);
+    double erfc_r = erfc_as(r*xi), erfc_rm = erfc_as(rm*xi), erfc_rp = erfc_as(rp*xi);
+    double f1 = (18.0*r2*xi2 + 3.0)/(64.0*sqrt_pi*a*r2*xi3);
+    double f2 = (2.0*xi2*(2.0*a-r)*(4.0*a*a+4.0*a*r+9.0*r2) - 2.0*a - 3.0*r)/(128.0*sqrt_pi*a*r3*xi3);
+    double f3 = (-2.0*xi2*(2.0*a+r)*(4.0*a*a-4.0*a*r+9.0*r2) + 2.0*a - 3.0*r)/(128.0*sqrt_pi*a*r3*xi3);
+    double f4 = (3.0 - 36.0*r4*xi4)/(128.0*a*r3*xi4);
+    double f5 = (4.0*xi4*rm*rm*(4.0*a*a+4.0*a*r+9.0*r2) - 3.0)/(256.0*a*r3*xi4);
+    double f6 = (4.0*xi4*rp*rp*(4.0*a*a-4.0*a*r+9.0*r2) - 3.0)/(256.0*a*r3*xi4);
+    double g1 = (6.0*r2*xi2 - 3.0)/(32.0*sqrt_pi*a*r2*xi3);
+    double g2 = (-2.0*xi2*rm*rm*(2.0*a+3.0*r) + 2.0*a + 3.0*r)/(64.0*sqrt_pi*a*r3*xi3);
+    double g3 = (2.0*xi2*rp*rp*(2.0*a-3.0*r) - 2.0*a + 3.0*r)/(64.0*sqrt_pi*a*r3*xi3);
+    double g4 = -3.0*(4.0*r4*xi4 + 1.0)/(64.0*a*r3*xi4);
+    double am = 2.0*a - r;
+    double g5 = (3.0 - 4.0*xi4*am*am*am*(2.0*a+3.0*r))/(128.0*a*r3*xi4);
+    double g6 = (3.0 - 4.0*xi4*(2.0*a-3.0*r)*rp*rp*rp)/(128.0*a*r3*xi4);
+    double f0, g0;
+    if (r > 2.0*a) { f0 = 0.0; g0 = 0.0; }
+    else {
+        f0 = -rm*rm*(4.0*a*a+4.0*a*r+9.0*r2)/(32.0*a*r3);
+        g0 = am*am*am*(2.0*a+3.0*r)/(16.0*a*r3);
+    }
+    *Fo = f0 + f1*e_r + f2*e_rm + f3*e_rp + f4*erfc_r + f5*erfc_rm + f6*erfc_rp;
+    *Go = g0 + g1*e_r + g2*e_rm + g3*e_rp + g4*erfc_r + g5*erfc_rm + g6*erfc_rp;
+}
+
+// Real-space (short-range) part of the sinc^2 / Hasimoto periodic RPY apply:
+// the F,G screened lattice sum (1/(6a)[F(I-rr)+G rr]) over images, plus the A4
+// self term on the diagonal. No mu0, no backflow (the sinc^2 split holds the
+// whole self mobility). Mirror of pse_real for the positive-split kernel.
+extern "C" __global__ void pse_real_sinc(
+    double *u, const double *pos, const double *force, int n,
+    double box_l, double sigma, double r_cut, double a)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double PI = 3.14159265358979323846;
+    const double sqrt2 = 1.41421356237309504880;
+    double sqrt_pi = sqrt(PI);
+    double xi = 1.0 / (sigma * sqrt2);
+    double inv6a = 1.0 / (6.0 * a);
+    double a4 = (1.0/(4.0*sqrt_pi*xi*a)) * (1.0 - exp(-4.0*a*a*xi*xi) + 4.0*sqrt_pi*a*xi*erfc_as(2.0*a*xi));
+    double self_diag = inv6a * a4;
+    int span = (int)ceil(r_cut / box_l) + 1;
+    double pix = pos[3*i+0], piy = pos[3*i+1], piz = pos[3*i+2];
+    double ux = 0.0, uy = 0.0, uz = 0.0;
+
+    for (int j = 0; j < n; j++) {
+        int is_self = (j == i);
+        double rijx = pix - pos[3*j+0];
+        double rijy = piy - pos[3*j+1];
+        double rijz = piz - pos[3*j+2];
+        double m00=0,m01=0,m02=0,m10=0,m11=0,m12=0,m20=0,m21=0,m22=0;
+
+        for (int nx = -span; nx <= span; nx++)
+        for (int ny = -span; ny <= span; ny++)
+        for (int nz = -span; nz <= span; nz++) {
+            if (is_self && nx==0 && ny==0 && nz==0) continue;
+            double dx = rijx + nx*box_l, dy = rijy + ny*box_l, dz = rijz + nz*box_l;
+            double r2 = dx*dx + dy*dy + dz*dz;
+            double r = sqrt(r2);
+            if (r > r_cut || r == 0.0) continue;
+            double ex = dx/r, ey = dy/r, ez = dz/r;
+            double F, G; fg_sinc(r, a, xi, &F, &G);
+            // (1/6a)[F(I - rr) + G rr] = inv6a*(F I + (G - F) rr)
+            double id_part = inv6a * F;
+            double rr_part = inv6a * (G - F);
+            m00 += id_part + rr_part*ex*ex; m01 += rr_part*ex*ey; m02 += rr_part*ex*ez;
+            m10 += rr_part*ey*ex; m11 += id_part + rr_part*ey*ey; m12 += rr_part*ey*ez;
+            m20 += rr_part*ez*ex; m21 += rr_part*ez*ey; m22 += id_part + rr_part*ez*ez;
+        }
+        if (is_self) { m00 += self_diag; m11 += self_diag; m22 += self_diag; }
+
+        double fx = force[3*j+0], fy = force[3*j+1], fz = force[3*j+2];
+        ux += m00*fx + m01*fy + m02*fz;
+        uy += m10*fx + m11*fy + m12*fz;
+        uz += m20*fx + m21*fy + m22*fz;
+    }
+    u[3*i+0] = ux; u[3*i+1] = uy; u[3*i+2] = uz;
+}
+
 // Truncated-support spread: one thread per PARTICLE scatters its force to the
 // (2*support+1)^3 nearest grid nodes with the Gaussian window, via atomicAdd. The
 // per-particle cost is O(support^3), independent of ng (the O(N log N) spread).
@@ -502,6 +592,7 @@ pub struct GpuPseWave {
     noise_scale: CudaFunction,
     gather: CudaFunction,
     real: CudaFunction,
+    real_sinc: CudaFunction,
     spread_trunc: CudaFunction,
     gather_trunc: CudaFunction,
     /// Reusable device buffers (the twelve `ng^3` grids plus the `3n` vectors),
@@ -537,6 +628,7 @@ impl GpuPseWave {
             .map_err(driver_err)?;
         let gather = module.load_function("pse_gather").map_err(driver_err)?;
         let real = module.load_function("pse_real").map_err(driver_err)?;
+        let real_sinc = module.load_function("pse_real_sinc").map_err(driver_err)?;
         let spread_trunc = module
             .load_function("pse_spread_trunc")
             .map_err(driver_err)?;
@@ -552,6 +644,7 @@ impl GpuPseWave {
             noise_scale,
             gather,
             real,
+            real_sinc,
             spread_trunc,
             gather_trunc,
             scratch: RefCell::new(None),
@@ -786,6 +879,35 @@ impl GpuPseWave {
         forces: &[Vec3],
         ep: &EwaldParams,
     ) -> Result<Vec<Vec3>, ErmakError> {
+        self.real_apply_with(pos, forces, ep, &self.real)
+    }
+
+    /// Real-space (short-range) part of the positively-split sinc^2 / Hasimoto
+    /// mobility apply on the device (the `pse_real_sinc` kernel: the F,G screened
+    /// lattice sum plus the A4 self term, no mu0 or backflow). Matches the dense
+    /// real part of [`crate::hydro::pse_wave_hasimoto::real_sinc_block`] plus
+    /// [`crate::hydro::pse_wave_hasimoto::self_real_sinc`]. `ep.k_max` is unused.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any driver error.
+    pub fn real_apply_sinc_gpu(
+        &self,
+        pos: &[Vec3],
+        forces: &[Vec3],
+        ep: &EwaldParams,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        self.real_apply_with(pos, forces, ep, &self.real_sinc)
+    }
+
+    /// Shared real-space apply driver; `func` is the GRPerY (`pse_real`) or sinc^2
+    /// (`pse_real_sinc`) short-range kernel (identical argument layout).
+    fn real_apply_with(
+        &self,
+        pos: &[Vec3],
+        forces: &[Vec3],
+        ep: &EwaldParams,
+        func: &CudaFunction,
+    ) -> Result<Vec<Vec3>, ErmakError> {
         let n = pos.len();
         assert_eq!(forces.len(), n, "forces and positions length mismatch");
         let host_pos: Vec<f64> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
@@ -804,7 +926,7 @@ impl GpuPseWave {
             block_dim: (64, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut b = self.stream.launch_builder(&self.real);
+        let mut b = self.stream.launch_builder(func);
         b.arg(&mut d_u);
         b.arg(&d_pos);
         b.arg(&d_f);
@@ -840,6 +962,30 @@ impl GpuPseWave {
         let u_real = self.real_apply_gpu(pos, forces, ep)?;
         let wp = WaveParams::new(ep.box_l, ep.sigma, ep.a, ng);
         let u_wave = self.recip_apply_pse_gpu(pos, forces, &wp)?;
+        Ok(u_real
+            .iter()
+            .zip(u_wave.iter())
+            .map(|(r, w)| *r + *w)
+            .collect())
+    }
+
+    /// Full periodic mobility apply on the positively-split sinc^2 / Hasimoto
+    /// kernel: real part (`pse_real_sinc`) plus the FFT wave part
+    /// ([`Self::recip_apply_pse_sinc_gpu`]), matching the dense
+    /// [`crate::hydro::pse_wave_hasimoto::periodic_grand_mobility_sinc`] apply.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any device or cuFFT error.
+    pub fn full_apply_sinc(
+        &self,
+        pos: &[Vec3],
+        forces: &[Vec3],
+        ep: &EwaldParams,
+        ng: usize,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        let u_real = self.real_apply_sinc_gpu(pos, forces, ep)?;
+        let wp = WaveParams::new(ep.box_l, ep.sigma, ep.a, ng);
+        let u_wave = self.recip_apply_pse_sinc_gpu(pos, forces, &wp)?;
         Ok(u_real
             .iter()
             .zip(u_wave.iter())
@@ -1434,6 +1580,36 @@ mod tests {
         assert!(
             err < 1e-4,
             "GPU sinc^2 PSE must match the dense screened sinc^2 sum; {err:.3e}"
+        );
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_sinc_full_matches_dense --nocapture
+    // The GPU full sinc^2 apply (real-space pse_real_sinc + FFT wave) reproduces
+    // the dense full sinc^2 grand mobility apply.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_sinc_full_matches_dense() {
+        use crate::hydro::mobility::apply_mobility;
+        use crate::hydro::pse_wave_hasimoto::periodic_grand_mobility_sinc;
+        let (l, sigma, a, pos, forces) = setup();
+        let ep = EwaldParams {
+            box_l: l,
+            sigma,
+            r_cut: 13.0,
+            k_max: 12,
+            a,
+        };
+        let m = periodic_grand_mobility_sinc(&pos, &ep);
+        let u_dense = apply_mobility(&m, &forces);
+        let dev = GpuPseWave::new().expect("cuda");
+        let u_pse = dev
+            .full_apply_sinc(&pos, &forces, &ep, 32)
+            .expect("full sinc");
+        let err = max_abs(&u_dense, &u_pse);
+        eprintln!("gpu-pse-sinc-full-vs-dense: max_abs={err:.3e}");
+        assert!(
+            err < 1e-4,
+            "sinc^2 full apply must match the dense sinc^2 mobility; {err:.3e}"
         );
     }
 
