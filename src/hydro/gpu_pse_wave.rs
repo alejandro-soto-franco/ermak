@@ -188,6 +188,54 @@ extern "C" __global__ void pse_scale_sinc(
     vkz[g].y = d02*fx.y + d12*fy.y + d22*fz.y;
 }
 
+// Single-FFT positive-split wave NOISE: scale complex white noise by the square
+// root of the sinc^2 wave Green factor, sqrt(D(k)) = sqrt(scalar) (I - k_hat k_hat)
+// (the projection is idempotent, so its square root is itself). Applied to a
+// per-mode complex white field a_k (Re,Im ~ N(0,1) independent, <a a^H> = 2 I),
+// the inverse FFT and gather of the result has covariance M^(w) up to the gather
+// h^3 weight, which the host corrects (1/sqrt(h^3)); see brownian_wave_noise_sinc.
+// The projection acts on the real and imaginary parts independently. k=0 zeroed.
+extern "C" __global__ void pse_noise_scale(
+    double2 *vkx, double2 *vky, double2 *vkz,
+    const double2 *wkx, const double2 *wky, const double2 *wkz,
+    int ng, double two_pi_l, double h3, double eta, double s, double a, double vol)
+{
+    const double PI = 3.14159265358979323846;
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    int ng3 = ng * ng * ng;
+    if (g >= ng3) return;
+    int px = g / (ng * ng);
+    int py = (g / ng) % ng;
+    int pz = g % ng;
+    int mx = (px < ng / 2) ? px : px - ng;
+    int my = (py < ng / 2) ? py : py - ng;
+    int mz = (pz < ng / 2) ? pz : pz - ng;
+    if (mx == 0 && my == 0 && mz == 0) {
+        vkx[g].x = 0.0; vkx[g].y = 0.0;
+        vky[g].x = 0.0; vky[g].y = 0.0;
+        vkz[g].x = 0.0; vkz[g].y = 0.0;
+        return;
+    }
+    double kx = mx * two_pi_l, ky = my * two_pi_l, kz = mz * two_pi_l;
+    double k2 = kx*kx + ky*ky + kz*kz;
+    double k = sqrt(k2);
+    double invk = 1.0 / k;
+    double hkx = kx * invk, hky = ky * invk, hkz = kz * invk;
+    double ka = k * a;
+    double sinc = sin(ka) / ka;
+    double s2f = sinc * sinc;
+    double q = k2 * s * s / 2.0;
+    double Hk = (1.0 + q) * exp(-q);
+    double scalar = (PI / vol) * s2f / k2 * Hk * h3 * exp(k2 * eta * eta);
+    double root = sqrt(scalar);
+    double2 wx = wkx[g], wy = wky[g], wz = wkz[g];
+    double kd_re = hkx*wx.x + hky*wy.x + hkz*wz.x;
+    double kd_im = hkx*wx.y + hky*wy.y + hkz*wz.y;
+    vkx[g].x = root * (wx.x - hkx*kd_re); vkx[g].y = root * (wx.y - hkx*kd_im);
+    vky[g].x = root * (wy.x - hky*kd_re); vky[g].y = root * (wy.y - hky*kd_im);
+    vkz[g].x = root * (wz.x - hkz*kd_re); vkz[g].y = root * (wz.y - hkz*kd_im);
+}
+
 // Gather the grid velocity back to particles (adjoint of spread, weight h^3).
 // One thread per particle loops over all grid points (mirror of the CPU gather).
 extern "C" __global__ void pse_gather(
@@ -451,6 +499,7 @@ pub struct GpuPseWave {
     spread: CudaFunction,
     scale: CudaFunction,
     scale_sinc: CudaFunction,
+    noise_scale: CudaFunction,
     gather: CudaFunction,
     real: CudaFunction,
     spread_trunc: CudaFunction,
@@ -483,6 +532,9 @@ impl GpuPseWave {
         let spread = module.load_function("pse_spread").map_err(driver_err)?;
         let scale = module.load_function("pse_scale").map_err(driver_err)?;
         let scale_sinc = module.load_function("pse_scale_sinc").map_err(driver_err)?;
+        let noise_scale = module
+            .load_function("pse_noise_scale")
+            .map_err(driver_err)?;
         let gather = module.load_function("pse_gather").map_err(driver_err)?;
         let real = module.load_function("pse_real").map_err(driver_err)?;
         let spread_trunc = module
@@ -497,6 +549,7 @@ impl GpuPseWave {
             spread,
             scale,
             scale_sinc,
+            noise_scale,
             gather,
             real,
             spread_trunc,
@@ -869,6 +922,155 @@ impl GpuPseWave {
             })
             .collect())
     }
+
+    /// Single-FFT positively-split wave Brownian displacement on the sinc^2 kernel:
+    /// `sqrt(2 kT dt) M^(w)^{1/2} xi` with covariance `2 kT dt M^(w)`, `M^(w)` the
+    /// screened sinc^2 wave mobility ([`Self::recip_apply_pse_sinc_gpu`]). Generated
+    /// in ONE inverse FFT (no Krylov iteration): fill the k-grid with complex white
+    /// noise, scale each mode by `sqrt(D(k))` (`pse_noise_scale`, a PSD scalar times
+    /// the projection), inverse FFT, gather. The construction is exact because the
+    /// wave Green factor is `(positive scalar)(I - k_hat k_hat)`, which the
+    /// indefinite GRPerY split forbids. The gather carries an extra `h^3` (it is
+    /// `h^3 spread^T`), so the gathered field has covariance `h^3 M^(w)`; the
+    /// `1/sqrt(h^3)` factor below corrects it, and `Re` is taken implicitly by the
+    /// gather reading the real grid component (with `<a a^H> = 2 I` this gives the
+    /// `1/2` that the real part needs).
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any device or cuFFT error.
+    pub fn brownian_wave_noise_sinc<R: Rng + ?Sized>(
+        &self,
+        pos: &[Vec3],
+        ep: &EwaldParams,
+        ng: usize,
+        kt: f64,
+        dt: f64,
+        rng: &mut R,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        let n = pos.len();
+        let ng3 = ng * ng * ng;
+        let l = ep.box_l;
+        #[allow(clippy::cast_precision_loss)]
+        let h = l / ng as f64;
+        let h3 = h * h * h;
+        let eta = 0.5 * ep.sigma; // full-grid default (matches WaveParams::new)
+        let s = ep.sigma;
+        let a = ep.a;
+        let vol = l * l * l;
+        let two_pi_l = 2.0 * std::f64::consts::PI / l;
+
+        // Complex white noise on the k-grid: Re, Im ~ N(0,1) so <a a^H> = 2 I.
+        let normal = Normal::new(0.0, 1.0).expect("unit normal");
+        let mut draw = || -> Vec<double2> {
+            (0..ng3)
+                .map(|_| double2 {
+                    x: normal.sample(rng),
+                    y: normal.sample(rng),
+                })
+                .collect()
+        };
+        let host_wx = draw();
+        let host_wy = draw();
+        let host_wz = draw();
+        let host_pos: Vec<f64> = pos.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let ng_i = ng as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let n_i = n as i32;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let (ng3_u, n_u) = (ng3 as u32, n as u32);
+        let block = 128u32;
+        let grid_cfg = LaunchConfig {
+            grid_dim: (ng3_u.div_ceil(block), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let particle_cfg = LaunchConfig {
+            grid_dim: (n_u.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // Reuse the cached buffer arena (keyed by n, ng): the white noise lands in
+        // the k-space force grids fk*, is scaled into vk*, inverse-FFT'd into vg*,
+        // and gathered. No per-draw device allocation (matters for per-step noise).
+        let mut guard = self.scratch.borrow_mut();
+        if guard.as_ref().is_none_or(|sc| sc.n != n || sc.ng != ng) {
+            *guard = Some(Scratch::new(&self.stream, n, ng)?);
+        }
+        let sc = guard.as_mut().expect("scratch present");
+        self.stream
+            .memcpy_htod(&host_pos, &mut sc.d_pos)
+            .map_err(driver_err)?;
+        self.stream
+            .memcpy_htod(&host_wx, &mut sc.fkx)
+            .map_err(driver_err)?;
+        self.stream
+            .memcpy_htod(&host_wy, &mut sc.fky)
+            .map_err(driver_err)?;
+        self.stream
+            .memcpy_htod(&host_wz, &mut sc.fkz)
+            .map_err(driver_err)?;
+
+        // scale white noise by sqrt(D(k)): vk* = sqrt(D) (I - k_hat k_hat) fk*
+        let mut b = self.stream.launch_builder(&self.noise_scale);
+        b.arg(&mut sc.vkx);
+        b.arg(&mut sc.vky);
+        b.arg(&mut sc.vkz);
+        b.arg(&sc.fkx);
+        b.arg(&sc.fky);
+        b.arg(&sc.fkz);
+        b.arg(&ng_i);
+        b.arg(&two_pi_l);
+        b.arg(&h3);
+        b.arg(&eta);
+        b.arg(&s);
+        b.arg(&a);
+        b.arg(&vol);
+        unsafe { b.launch(grid_cfg) }.map_err(driver_err)?;
+
+        // single inverse FFT per component (reuse the cached plan)
+        let mut cache = self.fft_cache.borrow_mut();
+        let fft = match cache.entry(ng) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Fft3d::new(self.stream.clone(), ng, ng, ng)?)
+            }
+        };
+        fft.inverse(&mut sc.vkx, &mut sc.vgx)?;
+        fft.inverse(&mut sc.vky, &mut sc.vgy)?;
+        fft.inverse(&mut sc.vkz, &mut sc.vgz)?;
+
+        // gather the real grid component (= Re of the inverse FFT) to particles
+        let mut b = self.stream.launch_builder(&self.gather);
+        b.arg(&mut sc.d_u);
+        b.arg(&sc.vgx);
+        b.arg(&sc.vgy);
+        b.arg(&sc.vgz);
+        b.arg(&sc.d_pos);
+        b.arg(&n_i);
+        b.arg(&ng_i);
+        b.arg(&h);
+        b.arg(&h3);
+        b.arg(&eta);
+        b.arg(&l);
+        unsafe { b.launch(particle_cfg) }.map_err(driver_err)?;
+
+        let out = self.stream.clone_dtoh(&sc.d_u).map_err(driver_err)?;
+        // covariance of `out` is h^3 M^(w); divide by sqrt(h^3) -> M^(w), then the
+        // fluctuation-dissipation factor sqrt(2 kT dt).
+        let scale = (2.0 * kt * dt).sqrt() / h3.sqrt();
+        Ok((0..n)
+            .map(|i| {
+                Vec3::new(
+                    scale * out[3 * i],
+                    scale * out[3 * i + 1],
+                    scale * out[3 * i + 2],
+                )
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1232,6 +1434,81 @@ mod tests {
         assert!(
             err < 1e-4,
             "GPU sinc^2 PSE must match the dense screened sinc^2 sum; {err:.3e}"
+        );
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_sinc_wave_noise_fd --nocapture
+    // The single-FFT positive-split wave noise has the fluctuation-dissipation
+    // covariance 2 kT dt M^(w): sampled covariance of the draws matches, where
+    // M^(w) is the deterministic sinc^2 wave apply (built column by column at the
+    // SAME ng so there is no particle-mesh-vs-dense discrepancy in the oracle).
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_sinc_wave_noise_fd_covariance() {
+        let ep = EwaldParams {
+            box_l: 10.0,
+            sigma: 2.5,
+            r_cut: 13.0,
+            k_max: 12,
+            a: 1.0,
+        };
+        let pos = vec![Vec3::new(3.0, 3.0, 3.0), Vec3::new(6.0, 3.0, 3.0)];
+        let n = pos.len();
+        let dim = 3 * n;
+        let (kt, dt) = (1.3_f64, 0.5_f64);
+        let ng = 16usize;
+        let dev = GpuPseWave::new().expect("cuda");
+
+        // M^(w) column j = deterministic sinc^2 wave apply to the unit force e_j.
+        let wp = WaveParams::new(ep.box_l, ep.sigma, ep.a, ng);
+        let mut mw = vec![0.0f64; dim * dim];
+        for j in 0..dim {
+            let mut f = vec![Vec3::ZERO; n];
+            match j % 3 {
+                0 => f[j / 3].x = 1.0,
+                1 => f[j / 3].y = 1.0,
+                _ => f[j / 3].z = 1.0,
+            }
+            let col = dev.recip_apply_pse_sinc_gpu(&pos, &f, &wp).expect("apply");
+            for i in 0..n {
+                mw[(3 * i) * dim + j] = col[i].x;
+                mw[(3 * i + 1) * dim + j] = col[i].y;
+                mw[(3 * i + 2) * dim + j] = col[i].z;
+            }
+        }
+
+        let mut rng = StdRng::seed_from_u64(20_260_607);
+        let samples = 2_500usize;
+        let mut cov = vec![0.0f64; dim * dim];
+        for _ in 0..samples {
+            let dr = dev
+                .brownian_wave_noise_sinc(&pos, &ep, ng, kt, dt, &mut rng)
+                .expect("wave noise");
+            let mut flat = vec![0.0f64; dim];
+            for i in 0..n {
+                flat[3 * i] = dr[i].x;
+                flat[3 * i + 1] = dr[i].y;
+                flat[3 * i + 2] = dr[i].z;
+            }
+            for a in 0..dim {
+                for b in 0..dim {
+                    cov[a * dim + b] += flat[a] * flat[b];
+                }
+            }
+        }
+        let mut max_rel = 0.0f64;
+        for a in 0..dim {
+            for b in 0..dim {
+                let est = cov[a * dim + b] / samples as f64;
+                let target = 2.0 * kt * dt * mw[a * dim + b];
+                let denom = (2.0 * kt * dt * mw[a * dim + a]).max(1e-12);
+                max_rel = max_rel.max((est - target).abs() / denom);
+            }
+        }
+        eprintln!("sinc wave-noise FD covariance max_rel={max_rel:.4} over {samples} draws");
+        assert!(
+            max_rel < 0.08,
+            "sinc wave noise FD covariance off by {max_rel:.3}"
         );
     }
 }
