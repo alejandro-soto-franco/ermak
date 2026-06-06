@@ -16,6 +16,7 @@
 use crate::error::ErmakError;
 use crate::hydro::ewald::EwaldParams;
 use crate::hydro::gpu_fft::Fft3d;
+use crate::hydro::gpu_noise::lanczos_half_apply;
 use crate::hydro::pse_wave::WaveParams;
 use crate::vec3::Vec3;
 use cudarc::cufft::sys::double2;
@@ -23,6 +24,8 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
+use rand::Rng;
+use rand_distr::{Distribution, Normal};
 use std::sync::Arc;
 
 fn driver_err(e: DriverError) -> ErmakError {
@@ -528,6 +531,82 @@ impl GpuPseWave {
             .map(|(r, w)| *r + *w)
             .collect())
     }
+
+    /// Full-mobility matvec on a flat `3N` vector via [`Self::full_apply`], for the
+    /// Lanczos noise driver.
+    fn full_matvec(
+        &self,
+        pos: &[Vec3],
+        ep: &EwaldParams,
+        ng: usize,
+        z: &[f64],
+    ) -> Result<Vec<f64>, ErmakError> {
+        let n = pos.len();
+        let zf: Vec<Vec3> = (0..n)
+            .map(|i| Vec3::new(z[3 * i], z[3 * i + 1], z[3 * i + 2]))
+            .collect();
+        let out = self.full_apply(pos, &zf, ep, ng)?;
+        let mut flat = vec![0.0f64; 3 * n];
+        for i in 0..n {
+            flat[3 * i] = out[i].x;
+            flat[3 * i + 1] = out[i].y;
+            flat[3 * i + 2] = out[i].z;
+        }
+        Ok(flat)
+    }
+
+    /// Mobility square-root apply `M^{1/2} z` driven by the PSE [`Self::full_apply`]
+    /// matvec (Lanczos/Krylov, [`lanczos_half_apply`]). Each Krylov step is one
+    /// FFT-accelerated full apply, so the noise is O(N log N) like the drift, with
+    /// no dense factorization. Exact to round-off at `m_iters = 3N`.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any device or cuFFT error in the matvecs.
+    pub fn mobility_half_apply_pse(
+        &self,
+        pos: &[Vec3],
+        ep: &EwaldParams,
+        ng: usize,
+        z: &[f64],
+        m_iters: usize,
+    ) -> Result<Vec<f64>, ErmakError> {
+        lanczos_half_apply(|v| self.full_matvec(pos, ep, ng, v), z, m_iters)
+    }
+
+    /// Correlated Brownian displacement via the PSE path: `sqrt(2 kT dt) M^{1/2} xi`,
+    /// `xi ~ N(0, I_{3N})`, with `M` the full periodic RPY mobility applied through
+    /// the FFT wave-space solve. Same fluctuation-dissipation covariance
+    /// `2 kT dt M` as the dense Lanczos path, generated in O(N log N) per matvec.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any device or cuFFT error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn brownian_noise_pse<R: Rng + ?Sized>(
+        &self,
+        pos: &[Vec3],
+        ep: &EwaldParams,
+        ng: usize,
+        kt: f64,
+        dt: f64,
+        m_iters: usize,
+        rng: &mut R,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        let n = pos.len();
+        let dim = 3 * n;
+        let normal = Normal::new(0.0, 1.0).expect("unit normal");
+        let xi: Vec<f64> = (0..dim).map(|_| normal.sample(rng)).collect();
+        let half = self.mobility_half_apply_pse(pos, ep, ng, &xi, m_iters)?;
+        let scale = (2.0 * kt * dt).sqrt();
+        Ok((0..n)
+            .map(|i| {
+                Vec3::new(
+                    scale * half[3 * i],
+                    scale * half[3 * i + 1],
+                    scale * half[3 * i + 2],
+                )
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +710,115 @@ mod tests {
             err < 1e-10,
             "GPU PSE must match the CPU reference; {err:.3e}"
         );
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_sqrt_squared --nocapture
+    // The PSE half-apply is a valid square root: sqrt(M)(sqrt(M) z) = M z (exact at
+    // m = 3N). With Task 3 (full_apply = dense M) and the host-side
+    // `gpu_noise::lanczos_noise_fd_covariance` pin (Lanczos sqrt -> 2 kT dt M
+    // covariance for any SPD matvec), this gives the FFT noise path the right
+    // fluctuation-dissipation covariance.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_sqrt_squared_recovers_mobility() {
+        let (l, sigma, a, pos, _f) = setup();
+        let ep = EwaldParams {
+            box_l: l,
+            sigma,
+            r_cut: 13.0,
+            k_max: 12,
+            a,
+        };
+        let n = pos.len();
+        let dim = 3 * n;
+        let ng = 24usize;
+        let dev = GpuPseWave::new().expect("cuda");
+        let mut rng = StdRng::seed_from_u64(5);
+        let z: Vec<f64> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
+
+        let half = dev
+            .mobility_half_apply_pse(&pos, &ep, ng, &z, dim)
+            .expect("half");
+        let twice = dev
+            .mobility_half_apply_pse(&pos, &ep, ng, &half, dim)
+            .expect("half2");
+        let zf: Vec<Vec3> = (0..n)
+            .map(|i| Vec3::new(z[3 * i], z[3 * i + 1], z[3 * i + 2]))
+            .collect();
+        let mz = dev.full_apply(&pos, &zf, &ep, ng).expect("mz");
+
+        let mut max_abs = 0.0f64;
+        for i in 0..n {
+            for (p, q) in [
+                (twice[3 * i], mz[i].x),
+                (twice[3 * i + 1], mz[i].y),
+                (twice[3 * i + 2], mz[i].z),
+            ] {
+                max_abs = max_abs.max((p - q).abs());
+            }
+        }
+        eprintln!("pse sqrt-squared vs M: max_abs={max_abs:.3e}");
+        assert!(max_abs < 1e-7, "sqrt(M)^2 must recover M; {max_abs:.3e}");
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_noise_fd --nocapture
+    // Direct fluctuation-dissipation pin through the FFT noise path: the sampled
+    // covariance of brownian_noise_pse equals 2 kT dt M (M the dense oracle). Small
+    // N and a modest sample count keep it runnable: each matvec is a full_apply
+    // that currently rebuilds the cuFFT plan (the caching follow-up), so this is
+    // the slow pin. The rigorous covariance claim is also covered by transitivity:
+    // gpu_pse_sqrt_squared_recovers_mobility (sqrt(M)^2 = M) + full_apply = dense M
+    // (gpu_pse_full_matches_dense_mobility) + gpu_noise::lanczos_noise_fd_covariance
+    // (the Lanczos sqrt yields 2 kT dt M for any SPD matvec).
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_noise_fd_covariance() {
+        use crate::hydro::ewald::periodic_grand_mobility;
+        let ep = EwaldParams {
+            box_l: 10.0,
+            sigma: 2.5,
+            r_cut: 13.0,
+            k_max: 12,
+            a: 1.0,
+        };
+        let pos = vec![Vec3::new(3.0, 3.0, 3.0), Vec3::new(6.0, 3.0, 3.0)];
+        let n = pos.len();
+        let dim = 3 * n;
+        let (kt, dt) = (1.3_f64, 0.5_f64);
+        let ng = 16usize;
+        let m = periodic_grand_mobility(&pos, &ep);
+
+        let dev = GpuPseWave::new().expect("cuda");
+        let mut rng = StdRng::seed_from_u64(20_260_606);
+        let samples = 2_500usize;
+        let mut cov = vec![0.0f64; dim * dim];
+        for _ in 0..samples {
+            let dr = dev
+                .brownian_noise_pse(&pos, &ep, ng, kt, dt, dim, &mut rng)
+                .expect("pse noise");
+            let mut flat = vec![0.0f64; dim];
+            for i in 0..n {
+                flat[3 * i] = dr[i].x;
+                flat[3 * i + 1] = dr[i].y;
+                flat[3 * i + 2] = dr[i].z;
+            }
+            for a in 0..dim {
+                for b in 0..dim {
+                    cov[a * dim + b] += flat[a] * flat[b];
+                }
+            }
+        }
+        let mut max_rel = 0.0f64;
+        for a in 0..dim {
+            for b in 0..dim {
+                let est = cov[a * dim + b] / samples as f64;
+                let target = 2.0 * kt * dt * m[a * dim + b];
+                let denom = (2.0 * kt * dt * m[a * dim + a]).max(1e-12);
+                max_rel = max_rel.max((est - target).abs() / denom);
+            }
+        }
+        eprintln!("pse FD covariance max_rel={max_rel:.4} over {samples} draws");
+        assert!(max_rel < 0.08, "PSE FD covariance off by {max_rel:.3}");
     }
 
     // cargo test --features gpu -- --ignored gpu_pse_full_matches_dense --nocapture
