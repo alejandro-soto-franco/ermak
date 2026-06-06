@@ -59,11 +59,17 @@ pub struct WaveParams {
     pub a: f64,
     pub eta: f64,
     pub ng: usize,
+    /// Gaussian spreading half-width in grid cells: a particle spreads to the
+    /// `(2*support + 1)^3` nearest grid nodes (truncated Spectral Ewald). A value
+    /// `>= ng/2` means the full grid (no truncation), which the CPU reference and
+    /// the full-grid GPU kernels use. The truncated GPU kernels read it for the
+    /// O(N P^3) window; the per-particle cost is then independent of `ng`.
+    pub support: usize,
 }
 
 impl WaveParams {
-    /// Defaults with `eta = sigma / 2` (so the residual k-space filter is
-    /// `exp(-k^2 sigma^2 / 4)`), the recommended Spectral-Ewald split.
+    /// Full-grid defaults with `eta = sigma / 2` (residual k-space filter
+    /// `exp(-k^2 sigma^2 / 4)`). `support = ng` marks the full-grid path.
     #[must_use]
     pub fn new(box_l: f64, sigma: f64, a: f64, ng: usize) -> Self {
         Self {
@@ -72,7 +78,31 @@ impl WaveParams {
             a,
             eta: 0.5 * sigma,
             ng,
+            support: ng,
         }
+    }
+
+    /// Truncated Spectral-Ewald parameters: an explicit spreading width `eta` and
+    /// support half-width (window `(2*support + 1)` per axis). The net wave filter
+    /// is independent of `eta` analytically, so a small `eta` (around the grid
+    /// spacing `h = box_l/ng`) gives a compact window with negligible aliasing
+    /// (`~exp(-2 pi^2 (eta/h)^2)`) and truncation (`~exp(-(support h / eta)^2 / 2)`).
+    #[must_use]
+    pub fn truncated(box_l: f64, sigma: f64, a: f64, ng: usize, eta: f64, support: usize) -> Self {
+        Self {
+            box_l,
+            sigma,
+            a,
+            eta,
+            ng,
+            support,
+        }
+    }
+
+    /// Whether the truncated-support GPU path applies (window smaller than the grid).
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        2 * self.support + 1 < self.ng
     }
 }
 

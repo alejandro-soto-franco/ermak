@@ -6,12 +6,17 @@
 //! and gather back to particles. The CPU reference and the dense
 //! [`crate::hydro::ewald::recip_space_block`] apply are the correctness oracles.
 //!
-//! The spread and gather kernels mirror the CPU reference exactly: one thread per
-//! grid point (spread) or per particle (gather), looping over the full set with
-//! the full periodic Gaussian, so the GPU result equals the CPU result to
-//! round-off and no atomics are needed. The truncated-support O(N log N)
-//! spreading is the perf follow-up; this milestone establishes the validated
-//! device path.
+//! Two spread/gather paths share the FFT and k-space scaling:
+//! - **full grid** (`WaveParams::new`): one thread per grid point (spread) or per
+//!   particle (gather) over the whole grid with the full periodic Gaussian, so the
+//!   GPU result equals the CPU reference to round-off, no atomics. The validation
+//!   path.
+//! - **truncated support** (`WaveParams::truncated`): one thread per particle
+//!   scatters/gathers only the `(2*support+1)^3` nearest nodes (atomicAdd for the
+//!   scatter), the O(N P^3) Spectral-Ewald window whose per-particle cost is
+//!   independent of `ng`. With `eta ~ h` the aliasing (`~exp(-2 pi^2)`) and the
+//!   truncation (`~exp(-support^2/2)`) are negligible, so it converges to the dense
+//!   reciprocal sum (support 5 reaches ~5e-9). The O(N log N) production path.
 
 use crate::error::ErmakError;
 use crate::hydro::ewald::EwaldParams;
@@ -253,6 +258,82 @@ extern "C" __global__ void pse_real(
     }
     u[3*i+0] = ux; u[3*i+1] = uy; u[3*i+2] = uz;
 }
+
+// Truncated-support spread: one thread per PARTICLE scatters its force to the
+// (2*support+1)^3 nearest grid nodes with the Gaussian window, via atomicAdd. The
+// per-particle cost is O(support^3), independent of ng (the O(N log N) spread).
+// The grids MUST be zeroed before launch (only the window is written). Node
+// indices wrap periodically; the Gaussian uses the unwrapped node position so the
+// displacement to the particle stays small (no image sum needed).
+extern "C" __global__ void pse_spread_trunc(
+    double2 *hgx, double2 *hgy, double2 *hgz,
+    const double *pos, const double *force,
+    int n, int ng, int support, double h, double eta)
+{
+    const double PI = 3.14159265358979323846;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    double px = pos[3*j+0], py = pos[3*j+1], pz = pos[3*j+2];
+    double fx = force[3*j+0], fy = force[3*j+1], fz = force[3*j+2];
+    double inv2e2 = 1.0 / (2.0 * eta * eta);
+    double norm = pow(2.0 * PI * eta * eta, -1.5);
+    long cx = lround(px / h), cy = lround(py / h), cz = lround(pz / h);
+    long ngl = ng;
+    for (int ox = -support; ox <= support; ox++) {
+        long gxu = cx + ox; double dx = gxu * h - px; double wx = exp(-dx*dx*inv2e2);
+        long gx = ((gxu % ngl) + ngl) % ngl;
+        for (int oy = -support; oy <= support; oy++) {
+            long gyu = cy + oy; double dy = gyu * h - py; double wy = exp(-dy*dy*inv2e2);
+            long gy = ((gyu % ngl) + ngl) % ngl;
+            for (int oz = -support; oz <= support; oz++) {
+                long gzu = cz + oz; double dz = gzu * h - pz;
+                long gz = ((gzu % ngl) + ngl) % ngl;
+                double w = norm * wx * wy * exp(-dz*dz*inv2e2);
+                long g = (gx * ngl + gy) * ngl + gz;
+                atomicAdd(&hgx[g].x, w * fx);
+                atomicAdd(&hgy[g].x, w * fy);
+                atomicAdd(&hgz[g].x, w * fz);
+            }
+        }
+    }
+}
+
+// Truncated-support gather: one thread per particle reads the grid velocity from
+// its (2*support+1)^3 window (adjoint of pse_spread_trunc, weight h^3). O(support^3).
+extern "C" __global__ void pse_gather_trunc(
+    double *u, const double2 *vgx, const double2 *vgy, const double2 *vgz,
+    const double *pos, int n, int ng, int support, double h, double h3, double eta)
+{
+    const double PI = 3.14159265358979323846;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    double px = pos[3*i+0], py = pos[3*i+1], pz = pos[3*i+2];
+    double inv2e2 = 1.0 / (2.0 * eta * eta);
+    double norm = pow(2.0 * PI * eta * eta, -1.5);
+    long cx = lround(px / h), cy = lround(py / h), cz = lround(pz / h);
+    long ngl = ng;
+    double ux = 0.0, uy = 0.0, uz = 0.0;
+    for (int ox = -support; ox <= support; ox++) {
+        long gxu = cx + ox; double dx = gxu * h - px; double wx = exp(-dx*dx*inv2e2);
+        long gx = ((gxu % ngl) + ngl) % ngl;
+        for (int oy = -support; oy <= support; oy++) {
+            long gyu = cy + oy; double dy = gyu * h - py; double wy = exp(-dy*dy*inv2e2);
+            long gy = ((gyu % ngl) + ngl) % ngl;
+            for (int oz = -support; oz <= support; oz++) {
+                long gzu = cz + oz; double dz = gzu * h - pz;
+                long gz = ((gzu % ngl) + ngl) % ngl;
+                double w = norm * wx * wy * exp(-dz*dz*inv2e2);
+                long g = (gx * ngl + gy) * ngl + gz;
+                ux += w * vgx[g].x;
+                uy += w * vgy[g].x;
+                uz += w * vgz[g].x;
+            }
+        }
+    }
+    u[3*i+0] = ux * h3;
+    u[3*i+1] = uy * h3;
+    u[3*i+2] = uz * h3;
+}
 "#;
 
 /// Reusable device buffers for the wave-space apply, sized to `(n, ng)`. Cached so
@@ -316,6 +397,8 @@ pub struct GpuPseWave {
     scale: CudaFunction,
     gather: CudaFunction,
     real: CudaFunction,
+    spread_trunc: CudaFunction,
+    gather_trunc: CudaFunction,
     /// Reusable device buffers (the twelve `ng^3` grids plus the `3n` vectors),
     /// keyed by `(n, ng)`; rebuilt only when the size changes. `RefCell` because
     /// the apply takes `&self`.
@@ -345,6 +428,12 @@ impl GpuPseWave {
         let scale = module.load_function("pse_scale").map_err(driver_err)?;
         let gather = module.load_function("pse_gather").map_err(driver_err)?;
         let real = module.load_function("pse_real").map_err(driver_err)?;
+        let spread_trunc = module
+            .load_function("pse_spread_trunc")
+            .map_err(driver_err)?;
+        let gather_trunc = module
+            .load_function("pse_gather_trunc")
+            .map_err(driver_err)?;
         Ok(Self {
             _ctx: ctx,
             stream,
@@ -352,6 +441,8 @@ impl GpuPseWave {
             scale,
             gather,
             real,
+            spread_trunc,
+            gather_trunc,
             scratch: RefCell::new(None),
             fft_cache: RefCell::new(HashMap::new()),
         })
@@ -408,8 +499,12 @@ impl GpuPseWave {
         let n_i = n as i32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let ng_i = ng as i32;
-
-        // --- 1. spread (one thread per grid point) ---
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let support_i = wp.support as i32;
+        let truncated = wp.is_truncated();
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let n_u = n as u32;
+        // Per-grid-point launch (full path) and per-particle launch (truncated path).
         #[allow(clippy::cast_possible_truncation)]
         let ng3_u = ng3 as u32;
         let block = 128u32;
@@ -418,18 +513,45 @@ impl GpuPseWave {
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut b = self.stream.launch_builder(&self.spread);
-        b.arg(&mut sc.hgx);
-        b.arg(&mut sc.hgy);
-        b.arg(&mut sc.hgz);
-        b.arg(&sc.d_pos);
-        b.arg(&sc.d_f);
-        b.arg(&n_i);
-        b.arg(&ng_i);
-        b.arg(&h);
-        b.arg(&eta);
-        b.arg(&l);
-        unsafe { b.launch(grid_cfg) }.map_err(driver_err)?;
+        let particle_cfg = LaunchConfig {
+            grid_dim: (n_u.div_ceil(64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        // --- 1. spread ---
+        if truncated {
+            // Truncated path scatters only the window per particle, so the spread
+            // grids must start at zero.
+            self.stream.memset_zeros(&mut sc.hgx).map_err(driver_err)?;
+            self.stream.memset_zeros(&mut sc.hgy).map_err(driver_err)?;
+            self.stream.memset_zeros(&mut sc.hgz).map_err(driver_err)?;
+            let mut b = self.stream.launch_builder(&self.spread_trunc);
+            b.arg(&mut sc.hgx);
+            b.arg(&mut sc.hgy);
+            b.arg(&mut sc.hgz);
+            b.arg(&sc.d_pos);
+            b.arg(&sc.d_f);
+            b.arg(&n_i);
+            b.arg(&ng_i);
+            b.arg(&support_i);
+            b.arg(&h);
+            b.arg(&eta);
+            unsafe { b.launch(particle_cfg) }.map_err(driver_err)?;
+        } else {
+            let mut b = self.stream.launch_builder(&self.spread);
+            b.arg(&mut sc.hgx);
+            b.arg(&mut sc.hgy);
+            b.arg(&mut sc.hgz);
+            b.arg(&sc.d_pos);
+            b.arg(&sc.d_f);
+            b.arg(&n_i);
+            b.arg(&ng_i);
+            b.arg(&h);
+            b.arg(&eta);
+            b.arg(&l);
+            unsafe { b.launch(grid_cfg) }.map_err(driver_err)?;
+        }
 
         // --- 2. forward FFT each component (spread grids reused as scratch) ---
         // Reuse the cached cuFFT plan for this grid size, building it on first use.
@@ -467,26 +589,35 @@ impl GpuPseWave {
         fft.inverse(&mut sc.vkz, &mut sc.vgz)?;
 
         // --- 5. gather (one thread per particle) ---
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let n_u = n as u32;
-        let gcfg = LaunchConfig {
-            grid_dim: (n_u.div_ceil(64), 1, 1),
-            block_dim: (64, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut b = self.stream.launch_builder(&self.gather);
-        b.arg(&mut sc.d_u);
-        b.arg(&sc.vgx);
-        b.arg(&sc.vgy);
-        b.arg(&sc.vgz);
-        b.arg(&sc.d_pos);
-        b.arg(&n_i);
-        b.arg(&ng_i);
-        b.arg(&h);
-        b.arg(&h3);
-        b.arg(&eta);
-        b.arg(&l);
-        unsafe { b.launch(gcfg) }.map_err(driver_err)?;
+        if truncated {
+            let mut b = self.stream.launch_builder(&self.gather_trunc);
+            b.arg(&mut sc.d_u);
+            b.arg(&sc.vgx);
+            b.arg(&sc.vgy);
+            b.arg(&sc.vgz);
+            b.arg(&sc.d_pos);
+            b.arg(&n_i);
+            b.arg(&ng_i);
+            b.arg(&support_i);
+            b.arg(&h);
+            b.arg(&h3);
+            b.arg(&eta);
+            unsafe { b.launch(particle_cfg) }.map_err(driver_err)?;
+        } else {
+            let mut b = self.stream.launch_builder(&self.gather);
+            b.arg(&mut sc.d_u);
+            b.arg(&sc.vgx);
+            b.arg(&sc.vgy);
+            b.arg(&sc.vgz);
+            b.arg(&sc.d_pos);
+            b.arg(&n_i);
+            b.arg(&ng_i);
+            b.arg(&h);
+            b.arg(&h3);
+            b.arg(&eta);
+            b.arg(&l);
+            unsafe { b.launch(particle_cfg) }.map_err(driver_err)?;
+        }
 
         let out = self.stream.clone_dtoh(&sc.d_u).map_err(driver_err)?;
         Ok((0..n)
@@ -744,6 +875,54 @@ mod tests {
         assert!(
             err < 1e-10,
             "GPU PSE must match the CPU reference; {err:.3e}"
+        );
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_truncated --nocapture
+    // The truncated-support spreading (O(N P^3) window) converges to the dense
+    // reciprocal Ewald sum as the support grows: with eta = h the aliasing is
+    // ~exp(-2 pi^2) and the truncation is ~exp(-(support)^2 / 2), so a small
+    // support already matches the dense oracle.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_truncated_converges_to_dense() {
+        let (l, sigma, a, pos, forces) = setup();
+        let ep = EwaldParams {
+            box_l: l,
+            sigma,
+            r_cut: 13.0,
+            k_max: 12,
+            a,
+        };
+        let u_dense = dense_recip_apply(&pos, &forces, &ep);
+        let dev = GpuPseWave::new().expect("cuda");
+        let ng = 32usize;
+        let h = l / ng as f64;
+        let eta = h; // ~1 cell: tiny aliasing, compact window
+        let mut prev = f64::INFINITY;
+        let mut finest = f64::INFINITY;
+        for &support in &[3usize, 5, 8] {
+            let wp = WaveParams::truncated(l, sigma, a, ng, eta, support);
+            assert!(
+                wp.is_truncated(),
+                "support {support} must truncate at ng={ng}"
+            );
+            let u = dev.recip_apply_pse_gpu(&pos, &forces, &wp).expect("trunc");
+            let err = max_abs(&u_dense, &u);
+            eprintln!(
+                "support={support:>2} (window {}^3) max_abs={err:.3e}",
+                2 * support + 1
+            );
+            assert!(
+                err <= prev,
+                "error must fall with support ({support}: {err:.3e})"
+            );
+            prev = err;
+            finest = err;
+        }
+        assert!(
+            finest < 1e-5,
+            "truncated spreading must match the dense reciprocal sum; {finest:.3e}"
         );
     }
 
