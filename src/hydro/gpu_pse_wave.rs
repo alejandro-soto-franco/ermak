@@ -133,6 +133,61 @@ extern "C" __global__ void pse_scale(
     vkz[g].y = d02*fx.y + d12*fy.y + d22*fz.y;
 }
 
+// Positively-split sinc^2 / Hasimoto wave Green factor (Fiore et al. 2017):
+// D(k) = h^3 exp(k^2 eta^2) (pi/V)(sinc^2(ka)/k^2) H(k,xi) (I - k_hat k_hat),
+// with H(k,xi) = (1 + q) exp(-q), q = k^2 s^2/2 (= k^2/(4 xi^2), xi = 1/(s sqrt2)).
+// Unlike pse_scale this tensor is a POSITIVE scalar times the projection
+// (I - k_hat k_hat), so it is PSD per mode: a single-FFT positive-split noise
+// draw exists for it. k=0 zeroed; one thread per mode (fftfreq layout).
+extern "C" __global__ void pse_scale_sinc(
+    double2 *vkx, double2 *vky, double2 *vkz,
+    const double2 *fkx, const double2 *fky, const double2 *fkz,
+    int ng, double two_pi_l, double h3, double eta, double s, double a, double vol)
+{
+    const double PI = 3.14159265358979323846;
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    int ng3 = ng * ng * ng;
+    if (g >= ng3) return;
+    int px = g / (ng * ng);
+    int py = (g / ng) % ng;
+    int pz = g % ng;
+    int mx = (px < ng / 2) ? px : px - ng;
+    int my = (py < ng / 2) ? py : py - ng;
+    int mz = (pz < ng / 2) ? pz : pz - ng;
+    if (mx == 0 && my == 0 && mz == 0) {
+        vkx[g].x = 0.0; vkx[g].y = 0.0;
+        vky[g].x = 0.0; vky[g].y = 0.0;
+        vkz[g].x = 0.0; vkz[g].y = 0.0;
+        return;
+    }
+    double kx = mx * two_pi_l, ky = my * two_pi_l, kz = mz * two_pi_l;
+    double k2 = kx*kx + ky*ky + kz*kz;
+    double k = sqrt(k2);
+    double invk = 1.0 / k;
+    double hkx = kx * invk, hky = ky * invk, hkz = kz * invk;
+    double ka = k * a;
+    double sinc = sin(ka) / ka;
+    double s2f = sinc * sinc;
+    double q = k2 * s * s / 2.0;
+    double Hk = (1.0 + q) * exp(-q);
+    double pre = (PI / vol) * s2f / k2 * Hk;
+    double dc = h3 * exp(k2 * eta * eta) * pre;
+    double d00 = dc * (1.0 - hkx*hkx);
+    double d01 = dc * (-hkx*hky);
+    double d02 = dc * (-hkx*hkz);
+    double d11 = dc * (1.0 - hky*hky);
+    double d12 = dc * (-hky*hkz);
+    double d22 = dc * (1.0 - hkz*hkz);
+
+    double2 fx = fkx[g], fy = fky[g], fz = fkz[g];
+    vkx[g].x = d00*fx.x + d01*fy.x + d02*fz.x;
+    vkx[g].y = d00*fx.y + d01*fy.y + d02*fz.y;
+    vky[g].x = d01*fx.x + d11*fy.x + d12*fz.x;
+    vky[g].y = d01*fx.y + d11*fy.y + d12*fz.y;
+    vkz[g].x = d02*fx.x + d12*fy.x + d22*fz.x;
+    vkz[g].y = d02*fx.y + d12*fy.y + d22*fz.y;
+}
+
 // Gather the grid velocity back to particles (adjoint of spread, weight h^3).
 // One thread per particle loops over all grid points (mirror of the CPU gather).
 extern "C" __global__ void pse_gather(
@@ -395,6 +450,7 @@ pub struct GpuPseWave {
     stream: Arc<CudaStream>,
     spread: CudaFunction,
     scale: CudaFunction,
+    scale_sinc: CudaFunction,
     gather: CudaFunction,
     real: CudaFunction,
     spread_trunc: CudaFunction,
@@ -426,6 +482,7 @@ impl GpuPseWave {
         let module = ctx.load_module(ptx).map_err(driver_err)?;
         let spread = module.load_function("pse_spread").map_err(driver_err)?;
         let scale = module.load_function("pse_scale").map_err(driver_err)?;
+        let scale_sinc = module.load_function("pse_scale_sinc").map_err(driver_err)?;
         let gather = module.load_function("pse_gather").map_err(driver_err)?;
         let real = module.load_function("pse_real").map_err(driver_err)?;
         let spread_trunc = module
@@ -439,6 +496,7 @@ impl GpuPseWave {
             stream,
             spread,
             scale,
+            scale_sinc,
             gather,
             real,
             spread_trunc,
@@ -449,19 +507,53 @@ impl GpuPseWave {
     }
 
     /// Wave-space reciprocal apply on the device: `U_recip_i = sum_j M_recip(r_ij) F_j`,
-    /// matching [`crate::hydro::pse_wave::recip_apply_pse`] (GRPerY units).
+    /// matching [`crate::hydro::pse_wave::recip_apply_pse`] (GRPerY units, the
+    /// polynomial Beenakker split).
     ///
     /// # Panics
     /// If `forces.len() != pos.len()`.
     ///
     /// # Errors
     /// [`ErmakError::Gpu`] on any driver or cuFFT error.
-    #[allow(clippy::too_many_lines)]
     pub fn recip_apply_pse_gpu(
         &self,
         pos: &[Vec3],
         forces: &[Vec3],
         wp: &WaveParams,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        self.recip_apply_inner(pos, forces, wp, false)
+    }
+
+    /// Wave-space apply on the positively-split sinc^2 / Hasimoto kernel, matching
+    /// the dense [`crate::hydro::pse_wave_hasimoto::recip_sinc_block`] (screened
+    /// wave part, GRPerY units). Same spread/cuFFT/gather pipeline as
+    /// [`Self::recip_apply_pse_gpu`]; only the per-mode Green factor differs (a PSD
+    /// scalar times `I - k_hat k_hat`), which is what enables the single-FFT noise.
+    ///
+    /// # Panics
+    /// If `forces.len() != pos.len()`.
+    ///
+    /// # Errors
+    /// [`ErmakError::Gpu`] on any driver or cuFFT error.
+    pub fn recip_apply_pse_sinc_gpu(
+        &self,
+        pos: &[Vec3],
+        forces: &[Vec3],
+        wp: &WaveParams,
+    ) -> Result<Vec<Vec3>, ErmakError> {
+        self.recip_apply_inner(pos, forces, wp, true)
+    }
+
+    /// Shared spread/cuFFT/scale/gather pipeline for both wave kernels; `sinc`
+    /// selects the positively-split sinc^2 Green factor (`pse_scale_sinc`) over the
+    /// GRPerY polynomial one (`pse_scale`).
+    #[allow(clippy::too_many_lines)]
+    fn recip_apply_inner(
+        &self,
+        pos: &[Vec3],
+        forces: &[Vec3],
+        wp: &WaveParams,
+        sinc: bool,
     ) -> Result<Vec<Vec3>, ErmakError> {
         let n = pos.len();
         assert_eq!(forces.len(), n, "forces and positions length mismatch");
@@ -566,8 +658,10 @@ impl GpuPseWave {
         fft.forward(&mut sc.hgy, &mut sc.fky)?;
         fft.forward(&mut sc.hgz, &mut sc.fkz)?;
 
-        // --- 3. scale each mode by D(k) ---
-        let mut b = self.stream.launch_builder(&self.scale);
+        // --- 3. scale each mode by D(k) (GRPerY polynomial or sinc^2 PSD form) ---
+        let a = wp.a;
+        let scale_fn = if sinc { &self.scale_sinc } else { &self.scale };
+        let mut b = self.stream.launch_builder(scale_fn);
         b.arg(&mut sc.vkx);
         b.arg(&mut sc.vky);
         b.arg(&mut sc.vkz);
@@ -579,7 +673,9 @@ impl GpuPseWave {
         b.arg(&h3);
         b.arg(&eta);
         b.arg(&s);
-        b.arg(&a2);
+        // pse_scale takes a^2, pse_scale_sinc takes a (it needs k*a for sinc).
+        let a_arg = if sinc { a } else { a2 };
+        b.arg(&a_arg);
         b.arg(&vol);
         unsafe { b.launch(grid_cfg) }.map_err(driver_err)?;
 
@@ -1086,6 +1182,56 @@ mod tests {
         assert!(
             err < 1e-4,
             "GPU PSE must match the dense reciprocal Ewald sum; {err:.3e}"
+        );
+    }
+
+    /// Dense sinc^2 wave oracle: U_i = sum_j recip_sinc_block(r_ij, screened) F_j.
+    fn dense_recip_sinc_apply(pos: &[Vec3], forces: &[Vec3], ep: &EwaldParams) -> Vec<Vec3> {
+        use crate::hydro::pse_wave_hasimoto::recip_sinc_block;
+        let n = pos.len();
+        let mut out = vec![Vec3::ZERO; n];
+        for i in 0..n {
+            let mut acc = Vec3::ZERO;
+            for j in 0..n {
+                let blk = recip_sinc_block(pos[i] - pos[j], ep, true);
+                let f = forces[j];
+                acc += Vec3::new(
+                    blk.0[0] * f.x + blk.0[1] * f.y + blk.0[2] * f.z,
+                    blk.0[3] * f.x + blk.0[4] * f.y + blk.0[5] * f.z,
+                    blk.0[6] * f.x + blk.0[7] * f.y + blk.0[8] * f.z,
+                );
+            }
+            out[i] = acc;
+        }
+        out
+    }
+
+    // cargo test --features gpu -- --ignored gpu_pse_sinc_matches_dense --nocapture
+    // The GPU sinc^2 wave particle-mesh apply must reproduce the dense screened
+    // sinc^2 reciprocal sum to round-off (the same pipeline as the GRPerY path,
+    // only the k-space Green factor differs).
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_sinc_matches_dense_reciprocal() {
+        let (l, sigma, a, pos, forces) = setup();
+        let ep = EwaldParams {
+            box_l: l,
+            sigma,
+            r_cut: 13.0,
+            k_max: 12,
+            a,
+        };
+        let u_dense = dense_recip_sinc_apply(&pos, &forces, &ep);
+        let dev = GpuPseWave::new().expect("cuda");
+        let wp = WaveParams::new(l, sigma, a, 32);
+        let u_gpu = dev
+            .recip_apply_pse_sinc_gpu(&pos, &forces, &wp)
+            .expect("gpu pse sinc");
+        let err = max_abs(&u_dense, &u_gpu);
+        eprintln!("gpu-pse-sinc-vs-dense reciprocal: max_abs={err:.3e}");
+        assert!(
+            err < 1e-4,
+            "GPU sinc^2 PSE must match the dense screened sinc^2 sum; {err:.3e}"
         );
     }
 }
