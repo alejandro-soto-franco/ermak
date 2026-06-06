@@ -11,6 +11,7 @@ use crate::hydro::ForceParams;
 use crate::hydro::ewald::{EwaldParams, periodic_grand_mobility};
 use crate::hydro::gpu_ewald::GpuEwald;
 use crate::hydro::gpu_noise::brownian_noise_gpu;
+use crate::hydro::gpu_pse_wave::GpuPseWave;
 use crate::potential::{wca_pair_force, yukawa_pair_force};
 use crate::vec3::Vec3;
 use rand::Rng;
@@ -117,6 +118,50 @@ pub fn em_step_hi_gpu<R: Rng + ?Sized>(
     Ok(())
 }
 
+/// Advance one Ermak-McCammon step on the GPU PSE path (periodic box): the drift
+/// uses the FFT particle-mesh mobility ([`GpuPseWave::full_apply`], O(N log N))
+/// and the noise the Lanczos draw on that same apply ([`GpuPseWave::brownian_noise_pse`]),
+/// in place of the dense O(N^2 k^3) lattice sum of [`em_step_hi_gpu`]. Same GRPerY
+/// to physical unit folding (`inv_pi_eta`, `kt inv_pi_eta`), min-image conservative
+/// forces, and periodic wrap. Always hydrodynamic (the free-draining limit is the
+/// dense path's `hydro_on = false`). `ng` is the wave-grid size; `m_iters` the
+/// Lanczos depth (`3 * pos.len()` for an exact root at small N).
+///
+/// # Errors
+/// [`ErmakError::Gpu`] on any device or cuFFT error.
+#[allow(clippy::too_many_arguments)]
+pub fn em_step_hi_pse_gpu<R: Rng + ?Sized>(
+    dev: &GpuPseWave,
+    pos: &mut [Vec3],
+    charge: &[f64],
+    ep: &EwaldParams,
+    fp: ForceParams,
+    eta: f64,
+    kt: f64,
+    dt: f64,
+    ng: usize,
+    m_iters: usize,
+    rng: &mut R,
+) -> Result<(), ErmakError> {
+    let n = pos.len();
+    let inv_pi_eta = 1.0 / (PI * eta);
+    let forces = periodic_pair_forces(pos, charge, ep.box_l, fp);
+
+    let d_grpery = dev.full_apply(pos, &forces, ep, ng)?;
+    let drift: Vec<Vec3> = d_grpery.iter().map(|u| u.scale(inv_pi_eta)).collect();
+    let noise = dev.brownian_noise_pse(pos, ep, ng, kt * inv_pi_eta, dt, m_iters, rng)?;
+
+    for i in 0..n {
+        pos[i] += drift[i].scale(dt) + noise[i];
+        pos[i] = Vec3::new(
+            wrap(pos[i].x, ep.box_l),
+            wrap(pos[i].y, ep.box_l),
+            wrap(pos[i].z, ep.box_l),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +255,50 @@ mod tests {
         assert!(
             max_abs < 1e-12,
             "drift step must equal M_phys F dt; {max_abs:.3e}"
+        );
+    }
+
+    // (GPU) PSE step drift + units: at kT=0, one PSE step's displacement equals
+    // (full_apply(F)) inv_pi_eta dt, i.e. the FFT mobility wired with the GRPerY ->
+    // physical conversion. Validates the wiring; the PSE apply and noise are pinned
+    // in gpu_pse_wave.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn gpu_pse_step_drift_matches_apply() {
+        use crate::hydro::gpu_pse_wave::GpuPseWave;
+        let ep = ep10();
+        let eta = 0.31;
+        let inv_pi_eta = 1.0 / (PI * eta);
+        let dt = 0.001;
+        let ng = 24usize;
+        let mut pos = vec![Vec3::new(4.0, 5.0, 5.0), Vec3::new(5.2, 5.0, 5.0)];
+        let charge = vec![0.0, 0.0];
+        let start = pos.clone();
+        let forces = periodic_pair_forces(&pos, &charge, ep.box_l, FP);
+
+        let dev = GpuPseWave::new().expect("cuda");
+        let u = dev.full_apply(&pos, &forces, &ep, ng).expect("full_apply");
+        let mut rng = StdRng::seed_from_u64(1);
+        em_step_hi_pse_gpu(
+            &dev, &mut pos, &charge, &ep, FP, eta, 0.0, dt, ng, 6, &mut rng,
+        )
+        .expect("pse step");
+
+        let mut max_abs = 0.0f64;
+        for i in 0..pos.len() {
+            let expect = start[i] + u[i].scale(inv_pi_eta * dt);
+            for (a, b) in [
+                (pos[i].x, expect.x),
+                (pos[i].y, expect.y),
+                (pos[i].z, expect.z),
+            ] {
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        eprintln!("pse step-drift vs full_apply: max_abs={max_abs:.3e}");
+        assert!(
+            max_abs < 1e-12,
+            "PSE drift step must equal M_phys F dt; {max_abs:.3e}"
         );
     }
 
