@@ -1,9 +1,16 @@
 [workspace]
 members = ["ermak-py"]
 
+# One version for the workspace. The core crate sat at 0.1.0 through the v0.2.0,
+# v0.2.1 and v0.3.0 tags because only ermak-py carried a version, and the wheel
+# takes its version from there. Both crates now inherit, so the two cannot
+# drift apart again.
+[workspace.package]
+version = "0.3.0"
+
 [package]
 name = "ermak"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 description = "Brownian dynamics of ligand diffusion and binding kinetics in crowded environments"
