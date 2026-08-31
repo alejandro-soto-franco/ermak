@@ -64,6 +64,35 @@ fn escape_time_one<R: rand::Rng + ?Sized>(
     max_steps as f64 * dt // censored: did not escape in time
 }
 
+/// Every trajectory's first-passage time out of the pocket, one per replica.
+///
+/// [`mean_residence_time`] averages these. The sample itself is what a
+/// competing process needs: when a bound complex is racing some other event,
+/// the winner is decided by the whole distribution of survival times and not by
+/// its mean, and Brownian dynamics in a pocket does not give an exponential
+/// one. Rebinding after a partial escape puts weight at long times that a
+/// single rate constant cannot represent.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn escape_times(
+    barrier: f64,
+    r_b: f64,
+    d0: f64,
+    dt: f64,
+    max_steps: usize,
+    replicas: usize,
+    seed: u64,
+) -> Vec<f64> {
+    (0..replicas)
+        .into_par_iter()
+        .map(|rep| {
+            let mut rng =
+                StdRng::seed_from_u64(seed ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            escape_time_one(barrier, r_b, d0, dt, max_steps, 0.0, 0, &mut rng)
+        })
+        .collect()
+}
+
 /// Mean residence time (`1/k_off`) from plain Brownian dynamics: the average
 /// first-passage time out of the pocket over `replicas` independent ligands.
 #[allow(clippy::too_many_arguments)]
@@ -77,15 +106,8 @@ pub fn mean_residence_time(
     replicas: usize,
     seed: u64,
 ) -> f64 {
-    (0..replicas)
-        .into_par_iter()
-        .map(|rep| {
-            let mut rng =
-                StdRng::seed_from_u64(seed ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            escape_time_one(barrier, r_b, d0, dt, max_steps, 0.0, 0, &mut rng)
-        })
-        .sum::<f64>()
-        / replicas as f64
+    let times = escape_times(barrier, r_b, d0, dt, max_steps, replicas, seed);
+    times.iter().sum::<f64>() / times.len() as f64
 }
 
 /// Mean tauRAMD egress time: average escape time under a reoriented
@@ -171,6 +193,21 @@ pub fn escape_path(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_escape_sample_reproduces_its_own_mean() {
+        // `mean_residence_time` is the average of `escape_times`, so the two
+        // must agree exactly on the same seed. This pins the refactor that
+        // exposed the sample.
+        let (barrier, r_b, d0, dt, max_steps, replicas, seed) =
+            (4.0, 1.0, 1.0, 1e-3, 200_000, 256, 7);
+        let times = escape_times(barrier, r_b, d0, dt, max_steps, replicas, seed);
+        let mean = mean_residence_time(barrier, r_b, d0, dt, max_steps, replicas, seed);
+        assert_eq!(times.len(), replicas);
+        let from_sample = times.iter().sum::<f64>() / times.len() as f64;
+        assert!((from_sample - mean).abs() < 1e-12, "{from_sample} against {mean}");
+        assert!(times.iter().all(|t| *t > 0.0));
+    }
+
     use super::*;
 
     #[test]
