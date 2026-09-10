@@ -204,7 +204,10 @@ mod tests {
         let mean = mean_residence_time(barrier, r_b, d0, dt, max_steps, replicas, seed);
         assert_eq!(times.len(), replicas);
         let from_sample = times.iter().sum::<f64>() / times.len() as f64;
-        assert!((from_sample - mean).abs() < 1e-12, "{from_sample} against {mean}");
+        assert!(
+            (from_sample - mean).abs() < 1e-12,
+            "{from_sample} against {mean}"
+        );
         assert!(times.iter().all(|t| *t > 0.0));
     }
 
